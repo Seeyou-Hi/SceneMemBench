@@ -1,10 +1,10 @@
 # SceneMemBench project website
 
-https://seeyou-hi.github.io/SceneMemBench/
+https://yuheng-si.github.io/SceneMemBench/
 
 Static HTML, CSS and JavaScript. GitHub Pages source: the root of the `page` branch.
 
-Code: https://github.com/Seeyou-Hi/SceneMemBench
+Code: https://github.com/Yuheng-Si/SceneMemBench
 
 Dataset: https://huggingface.co/datasets/scenemembench/SceneMemBench
 
