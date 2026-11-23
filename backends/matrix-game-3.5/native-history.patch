@@ -1,0 +1,4044 @@
+diff --git a/configs/infer_first_person.yaml b/configs/infer_first_person.yaml
+index d9978c2..f38ed4d 100644
+--- a/configs/infer_first_person.yaml
++++ b/configs/infer_first_person.yaml
+@@ -120,6 +120,7 @@ val_dataset_index_path: null
+ val_dataset_path_shuffle_seed: 42
+ val_ratio: 0.0
+ validation_cfg_scale: 5.0
++validation_mosaic_guidance_scale: 1.0
+ validation_clean_latent_history_count: 1
+ validation_clean_latent_pool_history: false
+ validation_clean_latent_pool_history_bias: 1
+diff --git a/configs/infer_third_person.yaml b/configs/infer_third_person.yaml
+index 84c56b2..1eb218e 100644
+--- a/configs/infer_third_person.yaml
++++ b/configs/infer_third_person.yaml
+@@ -121,6 +121,7 @@ val_dataset_index_path: null
+ val_dataset_path_shuffle_seed: 42
+ val_ratio: 0.0
+ validation_cfg_scale: 5.0
++validation_mosaic_guidance_scale: 1.0
+ validation_clean_latent_history_count: 1
+ validation_clean_latent_pool_history: false
+ validation_clean_latent_pool_history_bias: 1
+diff --git a/diffsynth/core/data/unified_dataset.py b/diffsynth/core/data/unified_dataset.py
+index 853b2ff..ee9527a 100644
+--- a/diffsynth/core/data/unified_dataset.py
++++ b/diffsynth/core/data/unified_dataset.py
+@@ -1576,6 +1576,8 @@ class _MosaicVideoSharedDataset(_MosaicDatasetBase):
+         mosaic_candidate_nms_pool_multiplier=2.0,
+         mosaic_coverage_grid_downsample=4,
+         mosaic_coverage_pool_stride=2,
++        mosaic_pose_coverage_pool_size=20,
++        mosaic_pose_coverage_max_view_angle_deg=75.0,
+         **kwargs,
+     ):
+         self.default_prompt = prompt
+@@ -1679,6 +1681,12 @@ class _MosaicVideoSharedDataset(_MosaicDatasetBase):
+             1, int(mosaic_coverage_grid_downsample)
+         )
+         self.mosaic_coverage_pool_stride = max(1, int(mosaic_coverage_pool_stride))
++        self.mosaic_pose_coverage_pool_size = max(
++            0, int(mosaic_pose_coverage_pool_size)
++        )
++        self.mosaic_pose_coverage_max_view_angle_deg = float(
++            mosaic_pose_coverage_max_view_angle_deg
++        )
+         super().__init__(*args, vipe_prompt_type=vipe_prompt_type, **kwargs)
+ 
+     def _dataset_cache_inputs_dict(self):
+@@ -1731,6 +1739,12 @@ class _MosaicVideoSharedDataset(_MosaicDatasetBase):
+                 "mosaic_coverage_pool_stride": int(
+                     self.mosaic_coverage_pool_stride
+                 ),
++                "mosaic_pose_coverage_pool_size": int(
++                    self.mosaic_pose_coverage_pool_size
++                ),
++                "mosaic_pose_coverage_max_view_angle_deg": float(
++                    self.mosaic_pose_coverage_max_view_angle_deg
++                ),
+             }
+         )
+         return base
+@@ -3351,6 +3365,10 @@ class _MosaicVideoDatasetBase(_MosaicVideoSharedDataset):
+                 ),
+                 coverage_grid_downsample=self.mosaic_coverage_grid_downsample,
+                 coverage_pool_stride=self.mosaic_coverage_pool_stride,
++                pose_coverage_pool_size=self.mosaic_pose_coverage_pool_size,
++                pose_coverage_max_view_angle_deg=(
++                    self.mosaic_pose_coverage_max_view_angle_deg
++                ),
+                 depth_downsample_pool=depth_downsample_pool,
+             )
+         finally:
+diff --git a/diffsynth/pipelines/wan_video.py b/diffsynth/pipelines/wan_video.py
+index 51ab088..1943d99 100644
+--- a/diffsynth/pipelines/wan_video.py
++++ b/diffsynth/pipelines/wan_video.py
+@@ -351,6 +351,50 @@ def _negative_no_context_inputs_shared(inputs_shared):
+     return negative_shared
+ 
+ 
++def _without_mosaic_inputs_shared(inputs_shared):
++    """Build the paired-guidance baseline with mosaic conditioning removed."""
++    without_mosaic = dict(inputs_shared)
++    mosaic_latent = without_mosaic.get("mosaic_latent")
++    if not torch.is_tensor(mosaic_latent):
++        return without_mosaic
++
++    # Preserve explicit clean/noisy RoPE times while removing the mosaic slice.
++    rope_times = without_mosaic.get("latent_rope_time_indices")
++    first_latents = without_mosaic.get("first_frame_latents")
++    noisy_latents = without_mosaic.get("latents")
++    if rope_times is not None and torch.is_tensor(noisy_latents):
++        rope_times = torch.as_tensor(rope_times).reshape(-1)
++        first_count = (
++            int(first_latents.shape[2]) if torch.is_tensor(first_latents) else 0
++        )
++        mosaic_count = int(mosaic_latent.shape[2])
++        noisy_count = int(noisy_latents.shape[2])
++        expected = first_count + mosaic_count + noisy_count
++        if int(rope_times.numel()) != expected:
++            raise ValueError(
++                "Cannot remove mosaic from latent_rope_time_indices: expected "
++                f"{expected} entries, got {int(rope_times.numel())}."
++            )
++        without_mosaic["latent_rope_time_indices"] = torch.cat(
++            [
++                rope_times[:first_count],
++                rope_times[first_count + mosaic_count :],
++            ]
++        )
++
++    without_mosaic.update(
++        {
++            "mosaic_latent": None,
++            "mosaic_revgrid": None,
++            "mosaic_use_revgrid_rope": False,
++            "mosaic_view_change": None,
++            "mosaic_view_change_prope": False,
++            "mosaic_frame_indices": None,
++        }
++    )
++    return without_mosaic
++
++
+ def _drop_holes_reindex_prope_camera_info(
+     camera_info,
+     *,
+@@ -912,6 +956,7 @@ class WanVideoPipeline(BasePipeline):
+         cfg_merge: bool = False,
+         negative_no_prope: bool = False,
+         negative_no_context: bool = False,
++        mosaic_guidance_scale: float = 1.0,
+         # Boundary
+         switch_DiT_boundary: float = 0.875,
+         # Scheduler
+@@ -985,6 +1030,21 @@ class WanVideoPipeline(BasePipeline):
+                 "negative_no_context requires cfg_merge=False because the negative "
+                 "CFG branch must use a different clean context length."
+             )
++        mosaic_guidance_scale = float(mosaic_guidance_scale)
++        if not np.isfinite(mosaic_guidance_scale) or mosaic_guidance_scale <= 0.0:
++            raise ValueError(
++                "mosaic_guidance_scale must be finite and > 0, got "
++                f"{mosaic_guidance_scale!r}."
++            )
++        if (
++            mosaic_guidance_scale != 1.0
++            and mosaic_latent is not None
++            and tea_cache_l1_thresh is not None
++        ):
++            raise ValueError(
++                "Paired mosaic guidance is incompatible with TeaCache because "
++                "each denoising step evaluates two different conditioning states."
++            )
+         # Scheduler
+         self.scheduler.set_timesteps(
+             num_inference_steps,
+@@ -1086,6 +1146,17 @@ class WanVideoPipeline(BasePipeline):
+         self.load_models_to_device(self.in_iteration_models)
+         models = {name: getattr(self, name) for name in self.in_iteration_models}
+         model_fn_wan_video._rope_logged = False
++        paired_mosaic_guidance = (
++            mosaic_guidance_scale != 1.0
++            and torch.is_tensor(inputs_shared.get("mosaic_latent"))
++        )
++        if paired_mosaic_guidance:
++            print(
++                "[mosaic-guidance] Base paired guidance enabled: "
++                f"scale={mosaic_guidance_scale:g}; each denoising step runs "
++                "with and without mosaic conditioning.",
++                flush=True,
++            )
+         for progress_id, timestep in enumerate(
+             progress_bar_cmd(self.scheduler.timesteps)
+         ):
+@@ -1104,75 +1175,68 @@ class WanVideoPipeline(BasePipeline):
+                 dtype=self.torch_dtype, device=self.device
+             )
+ 
+-            # Inference
+-            with (
+-                self._temporary_prope_native_rope(
+-                    prope_disable_native_rope,
+-                    self.dit,
+-                    self.dit2,
+-                ),
+-                self._temporary_prope_t_rope(
+-                    prope_disable_t_rope,
+-                    self.dit,
+-                    self.dit2,
+-                ),
+-            ):
+-                noise_pred_posi = self.model_fn(
+-                    **models, **inputs_shared, **inputs_posi, timestep=timestep
+-                )
+-            if cfg_scale != 1.0:
++            def predict_with_text_cfg(shared_inputs):
++                with (
++                    self._temporary_prope_native_rope(
++                        prope_disable_native_rope,
++                        self.dit,
++                        self.dit2,
++                    ),
++                    self._temporary_prope_t_rope(
++                        prope_disable_t_rope,
++                        self.dit,
++                        self.dit2,
++                    ),
++                ):
++                    pred_posi = self.model_fn(
++                        **models, **shared_inputs, **inputs_posi, timestep=timestep
++                    )
++                if cfg_scale == 1.0:
++                    return pred_posi
+                 if cfg_merge:
+-                    noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
++                    pred_posi, pred_nega = pred_posi.chunk(2, dim=0)
+                 else:
+-                    inputs_shared_nega = (
+-                        _negative_no_context_inputs_shared(inputs_shared)
++                    shared_nega = (
++                        _negative_no_context_inputs_shared(shared_inputs)
+                         if negative_no_context
+-                        else inputs_shared
++                        else shared_inputs
+                     )
+                     if negative_no_prope:
+-                        with (
+-                            self._temporary_no_prope(self.dit, self.dit2),
+-                            self._temporary_prope_native_rope(
+-                                prope_disable_native_rope,
+-                                self.dit,
+-                                self.dit2,
+-                            ),
+-                            self._temporary_prope_t_rope(
+-                                prope_disable_t_rope,
+-                                self.dit,
+-                                self.dit2,
+-                            ),
+-                        ):
+-                            noise_pred_nega = self.model_fn(
+-                                **models,
+-                                **inputs_shared_nega,
+-                                **inputs_nega,
+-                                timestep=timestep,
+-                            )
++                        prope_context = self._temporary_no_prope(self.dit, self.dit2)
+                     else:
+-                        with (
+-                            self._temporary_prope_native_rope(
+-                                prope_disable_native_rope,
+-                                self.dit,
+-                                self.dit2,
+-                            ),
+-                            self._temporary_prope_t_rope(
+-                                prope_disable_t_rope,
+-                                self.dit,
+-                                self.dit2,
+-                            ),
+-                        ):
+-                            noise_pred_nega = self.model_fn(
+-                                **models,
+-                                **inputs_shared_nega,
+-                                **inputs_nega,
+-                                timestep=timestep,
+-                            )
+-                noise_pred = noise_pred_nega + cfg_scale * (
+-                    noise_pred_posi - noise_pred_nega
++                        prope_context = contextlib.nullcontext()
++                    with (
++                        prope_context,
++                        self._temporary_prope_native_rope(
++                            prope_disable_native_rope,
++                            self.dit,
++                            self.dit2,
++                        ),
++                        self._temporary_prope_t_rope(
++                            prope_disable_t_rope,
++                            self.dit,
++                            self.dit2,
++                        ),
++                    ):
++                        pred_nega = self.model_fn(
++                            **models,
++                            **shared_nega,
++                            **inputs_nega,
++                            timestep=timestep,
++                        )
++                return pred_nega + cfg_scale * (pred_posi - pred_nega)
++
++            noise_pred_with_mosaic = predict_with_text_cfg(inputs_shared)
++            if paired_mosaic_guidance:
++                inputs_without_mosaic = _without_mosaic_inputs_shared(inputs_shared)
++                noise_pred_without_mosaic = predict_with_text_cfg(
++                    inputs_without_mosaic
++                )
++                noise_pred = noise_pred_without_mosaic + mosaic_guidance_scale * (
++                    noise_pred_with_mosaic - noise_pred_without_mosaic
+                 )
+             else:
+-                noise_pred = noise_pred_posi
++                noise_pred = noise_pred_with_mosaic
+ 
+             # Scheduler
+             inputs_shared["latents"] = self.scheduler.step(
+diff --git a/distilled_config.py b/distilled_config.py
+index cfda695..a0a8556 100644
+--- a/distilled_config.py
++++ b/distilled_config.py
+@@ -25,10 +25,22 @@ class DistilledInferenceConfig:
+     chunk_size: int = 3
+     context_chunks: int = 7
+     context_selection: str = "per_3latentframe"
++    same_pose_refresh_interval_chunks: int = 0
++    same_pose_refresh_anchor_only_steps: int = 1
++    same_pose_refresh_reset_rolling: bool = True
+     memory_mode: str = "c0_plus_generated"
+     memory_publish_interval: int = 1
++    dense_latent_writeback: bool = False
++    dense_latent_dynamic_context: bool = False
++    dense_latent_max_trans_m: float = 0.25
++    dense_latent_max_rot_deg: float = 5.0
+     dynamic_context: bool = True
+     dynamic_context_selection: str = "oldest"
++    quality_weighted_retrieval: bool = False
++    quality_gated_context: bool = False
++    quality_retrieval_floor: float = 0.2
++    quality_context_threshold: float = 0.5
++    quality_trusted_ema: float = 0.05
+     nonlocal_memory_context: bool = False
+     context_pose_pool_size: int = 5
+     student_cfg_scale: float = 3.0
+@@ -87,6 +99,15 @@ def validate_inference_config(config: DistilledInferenceConfig) -> None:
+     if config.context_chunks < 0 or config.vae_context_blocks < 0:
+         raise ValueError("context block counts must be non-negative")
+     _validate_schedule(config.schedule)
++    if config.same_pose_refresh_interval_chunks < 0:
++        raise ValueError("same_pose_refresh_interval_chunks must be non-negative")
++    if not 0 <= config.same_pose_refresh_anchor_only_steps <= len(config.schedule):
++        raise ValueError(
++            "same_pose_refresh_anchor_only_steps must lie between 0 and the "
++            "number of schedule steps"
++        )
++    if config.same_pose_refresh_interval_chunks and config.profile != "standard":
++        raise ValueError("same-pose refresh currently requires profile=standard")
+     if config.profile != "hiar-sde" and config.hiar_scales:
+         raise ValueError("hiar_scales is only valid for profile=hiar-sde")
+     if config.hiar_scales:
+@@ -96,12 +117,22 @@ def validate_inference_config(config: DistilledInferenceConfig) -> None:
+             raise ValueError("hiar_scales values must be in [0, 1]")
+     if config.memory_publish_interval <= 0:
+         raise ValueError("memory_publish_interval must be positive")
++    if config.dense_latent_max_trans_m < 0.0:
++        raise ValueError("dense_latent_max_trans_m must be non-negative")
++    if not 0.0 <= config.dense_latent_max_rot_deg <= 180.0:
++        raise ValueError("dense_latent_max_rot_deg must be in [0, 180]")
+     if config.dynamic_context_selection not in {"latest", "oldest"}:
+         raise ValueError(
+             "dynamic_context_selection must be 'latest' or 'oldest'"
+         )
+     if config.context_pose_pool_size <= 0:
+         raise ValueError("context_pose_pool_size must be positive")
++    if not 0.0 <= config.quality_retrieval_floor <= 1.0:
++        raise ValueError("quality_retrieval_floor must be in [0, 1]")
++    if not 0.0 <= config.quality_context_threshold <= 1.0:
++        raise ValueError("quality_context_threshold must be in [0, 1]")
++    if not 0.0 <= config.quality_trusted_ema <= 1.0:
++        raise ValueError("quality_trusted_ema must be in [0, 1]")
+     if config.student_cfg_scale < 1.0:
+         raise ValueError("student_cfg_scale must be >= 1.0")
+     if config.student_cfg_scale > 1.0 and not config.negative_prompt.strip():
+diff --git a/examples/wanvideo/pipeline/mosaic/causal_config.py b/examples/wanvideo/pipeline/mosaic/causal_config.py
+index 61f56a6..db57710 100644
+--- a/examples/wanvideo/pipeline/mosaic/causal_config.py
++++ b/examples/wanvideo/pipeline/mosaic/causal_config.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from pathlib import Path
+ 
+ from distilled_config import DistilledInferenceConfig, profile_runtime_settings
+@@ -25,13 +26,26 @@ def build_runtime_args(
+     workspace = Path(workspace)
+     wan_dir = Path(wan_dir)
+     tokenizer_dir = Path(tokenizer_dir)
+-    model_spec = ",".join(
+-        (
+-            f"{wan_dir}:diffusion_pytorch_model*.safetensors",
+-            f"{wan_dir}:models_t5_umt5-xxl-enc-bf16.pth",
+-            f"{wan_dir}:Wan2.2_VAE.pth",
+-        )
+-    )
++    # DiffSynth treats ``model_id:pattern`` as a remote repository unless the
++    # entire string itself is an existing path.  A local directory followed by
++    # ``:pattern`` therefore becomes an invalid ModelScope id.  Pass the
++    # concrete local files through ``model_paths`` so sharded Wan weights are
++    # loaded without any hub lookup.
++    dit_shards = sorted(wan_dir.glob("diffusion_pytorch_model*.safetensors"))
++    # Keep all DiT shards inside one nested list.  DiffSynth hashes the merged
++    # key set to identify a model; passing each shard as an independent model
++    # makes every shard fail model-type detection.
++    local_model_paths = [
++        [str(path) for path in dit_shards],
++        str(wan_dir / "models_t5_umt5-xxl-enc-bf16.pth"),
++        str(wan_dir / "Wan2.2_VAE.pth"),
++    ]
++    if not dit_shards:
++        raise FileNotFoundError(f"No Wan2.2 diffusion shards found under {wan_dir}")
++    flat_model_paths = [path for group in local_model_paths for path in (group if isinstance(group, list) else [group])]
++    if not all(Path(path).is_file() for path in flat_model_paths):
++        missing = [path for path in flat_model_paths if not Path(path).is_file()]
++        raise FileNotFoundError(f"Missing local Wan2.2 model files: {missing}")
+     argv = [
+         "--dataset_type", "da3_video",
+         "--dataset_index_path", str(dataset_index),
+@@ -43,7 +57,7 @@ def build_runtime_args(
+         "--dataset_num_workers", "0",
+         "--memory_latent_cache_dir", str(memory_cache_dir),
+         "--tokenizer_path", str(tokenizer_dir),
+-        "--model_id_with_origin_paths", model_spec,
++        "--model_paths", json.dumps(local_model_paths),
+         "--trained_dit", str(checkpoint),
+         "--height", str(config.height),
+         "--width", str(config.width),
+@@ -94,10 +108,23 @@ def build_runtime_args(
+     args.causal_mode = True
+     args.causal_chunk_size = config.chunk_size
+     args.causal_context_chunks = config.context_chunks
++    args.causal_same_pose_refresh_interval_chunks = (
++        config.same_pose_refresh_interval_chunks
++    )
++    args.causal_same_pose_refresh_anchor_only_steps = (
++        config.same_pose_refresh_anchor_only_steps
++    )
++    args.causal_same_pose_refresh_reset_rolling = (
++        config.same_pose_refresh_reset_rolling
++    )
+     args.causal_memory_bootstrap_mode = "c0_only"
+     args.causal_validation_memory_bootstrap_mode = "c0_only"
+     args.causal_validation_memory_mode = config.memory_mode
+     args.causal_generated_memory_publish_interval = config.memory_publish_interval
++    args.causal_dense_latent_writeback = config.dense_latent_writeback
++    args.causal_dense_latent_dynamic_context = config.dense_latent_dynamic_context
++    args.causal_dense_latent_max_trans_m = config.dense_latent_max_trans_m
++    args.causal_dense_latent_max_rot_deg = config.dense_latent_max_rot_deg
+     args.causal_kv_dynamic_context = config.dynamic_context
+     args.causal_memory_context_selection_policy = (
+         "nonlocal_oldest" if config.nonlocal_memory_context else "legacy"
+@@ -106,6 +133,11 @@ def build_runtime_args(
+         config.dynamic_context_selection
+     )
+     args.causal_dynamic_context_pose_pool_size = config.context_pose_pool_size
++    args.causal_quality_weighted_retrieval = config.quality_weighted_retrieval
++    args.causal_quality_gated_context = config.quality_gated_context
++    args.causal_quality_retrieval_floor = config.quality_retrieval_floor
++    args.causal_quality_context_threshold = config.quality_context_threshold
++    args.causal_quality_trusted_ema = config.quality_trusted_ema
+     args.causal_kv_force_context_original_anchor = profile["force_original_anchor"]
+     args.causal_validation_prefix_noise_mode = profile["prefix_noise_mode"]
+     args.causal_validation_prefix_noise_dynamic_context = profile[
+diff --git a/examples/wanvideo/pipeline/mosaic/causal_inference.py b/examples/wanvideo/pipeline/mosaic/causal_inference.py
+index c49d548..9cca7fa 100644
+--- a/examples/wanvideo/pipeline/mosaic/causal_inference.py
++++ b/examples/wanvideo/pipeline/mosaic/causal_inference.py
+@@ -3,12 +3,16 @@
+ from __future__ import annotations
+ 
+ import gc
++import json
+ import os
+ 
++import numpy as np
+ import torch
+ 
+ from .causal_rollout import (
++    ResidentCausalRollout,
+     _normalize_causal_validation_memory_mode,
++    _iter_causal_kv_rollout,
+     _run_causal_kv_rollout,
+     _validation_memory_mode_uses_online_depth,
+     _validation_memory_mode_uses_runtime_pool,
+@@ -17,13 +21,84 @@ from .cleanup import _rank_local_cuda_device, _release_cached_memory
+ from .config import _intrinsics_mode_arg
+ from .timing import get_timing_reporter
+ from .video_io import (
++    _build_validation_candidate_history_frames,
+     _decode_latents_to_numpy_frames,
+     _get_frustum_handler_cls,
++    _history_verbose_frames,
+     _init_registration_estimator,
+     _write_video,
+ )
+ 
+ 
++def _frame_detail_score(frame):
++    arr = np.asarray(frame, dtype=np.float32)
++    gray = arr[..., :3].mean(axis=-1)
++    if min(gray.shape) < 3:
++        return 0.0
++    lap = (
++        -4.0 * gray[1:-1, 1:-1]
++        + gray[:-2, 1:-1]
++        + gray[2:, 1:-1]
++        + gray[1:-1, :-2]
++        + gray[1:-1, 2:]
++    )
++    return float(np.var(lap))
++
++
++def _add_decoded_detail_scores(latent_groups, generated_frames, mosaic_frames):
++    for group in latent_groups:
++        start = int(group["output_frame_start"])
++        end = int(group["output_frame_end"]) + 1
++        generated_slice = generated_frames[start:end]
++        mosaic_slice = mosaic_frames[start:end]
++        group["generated_detail_score"] = float(
++            np.mean([_frame_detail_score(frame) for frame in generated_slice])
++        ) if len(generated_slice) else 0.0
++        group["mosaic_decoded_detail_score"] = float(
++            np.mean([_frame_detail_score(frame) for frame in mosaic_slice])
++        ) if len(mosaic_slice) else 0.0
++
++
++def _write_memory_diagnostics(path, data, frames, mosaic_frames, mosaic_latents):
++    diagnostics = data.get("_causal_memory_diagnostics") or {}
++    candidate_groups = diagnostics.get("candidate_groups") or []
++    candidate_frames_by_id = diagnostics.get("candidate_frames_by_id") or {}
++    candidate_history_frames = _build_validation_candidate_history_frames(
++        history_frame_count=len(frames),
++        single_frame_shape=frames[0].shape,
++        candidate_groups=candidate_groups,
++        candidate_frames_by_id=candidate_frames_by_id,
++    )
++    verbose_frames = _history_verbose_frames(
++        frames,
++        mosaic_frames,
++        candidate_history_frames=candidate_history_frames,
++    )
++    _write_video(path, verbose_frames, fast_debug=True)
++
++    latent_groups = diagnostics.get("latent_groups") or []
++    _add_decoded_detail_scores(latent_groups, frames, mosaic_frames)
++    trace = {
++        "layout": {
++            "top_left": "generated RGB",
++            "bottom_left": "decoded warped/fused mosaic latent",
++            "right": "selected Patch Memory RGB frames; yellow labels are memory frame IDs",
++        },
++        "rgb_frame_count": int(len(frames)),
++        "memory_candidate_frame_count": int(len(candidate_frames_by_id)),
++        "latent_groups": latent_groups,
++        "memory_registration": data.get("_causal_validation_memory_stats") or {},
++        "kv_and_dynamic_context": data.get("_causal_validation_rope_stats") or {},
++    }
++    stem, _ = os.path.splitext(path)
++    trace_path = stem + ".json"
++    latent_path = stem + "_mosaic_latents.pt"
++    with open(trace_path, "w", encoding="utf-8") as handle:
++        json.dump(trace, handle, ensure_ascii=False, indent=2)
++    torch.save(mosaic_latents.detach().cpu(), latent_path)
++    return trace_path, latent_path
++
++
+ def _build_handler(data, args, *, height, width, latent_h, latent_w, estimator):
+     handler_cls = _get_frustum_handler_cls()
+     fixed_intrinsics = (
+@@ -52,9 +127,233 @@ def _build_handler(data, args, *, height, width, latent_h, latent_w, estimator):
+         fixed_intrinsics=fixed_intrinsics,
+         da3_process_res=int(args.causal_dmd_self_memory_da3_process_res),
+         da3_autocast_dtype=str(args.causal_dmd_self_memory_da3_autocast_dtype),
++        da3_align_input_pose_scale=bool(
++            getattr(args, "causal_dmd_self_memory_da3_align_input_pose_scale", False)
++        ),
+     )
+ 
+ 
++class DistilledResidentInference:
++    """Own one prepared MG3.5 rollout and expose one decoded chunk per step."""
++
++    def __init__(
++        self,
++        accelerator,
++        input_dataset,
++        model,
++        args,
++        *,
++        interactive_camera=False,
++    ):
++        if input_dataset is None or len(input_dataset) != 1:
++            raise ValueError("distilled resident inference requires exactly one input sample")
++        self.accelerator = accelerator
++        self.input_dataset = input_dataset
++        self.model = accelerator.unwrap_model(model)
++        self.model.eval()
++        self.args = args
++        self.timing = get_timing_reporter(self.model)
++        self.timing.start_record("distilled_resident_inference", epoch_id=-1)
++        dataloader = torch.utils.data.DataLoader(
++            input_dataset,
++            batch_size=1,
++            shuffle=False,
++            collate_fn=lambda rows: rows[0],
++            num_workers=0,
++        )
++        self.dataloader = accelerator.prepare(dataloader)
++
++        memory_mode = _normalize_causal_validation_memory_mode(
++            args.causal_validation_memory_mode
++        )
++        self.use_mosaic = bool(
++            self.model.enable_mosaic and not self.model.only_prope
++        )
++        needs_pool = self.use_mosaic and _validation_memory_mode_uses_runtime_pool(
++            memory_mode
++        )
++        needs_depth = needs_pool and _validation_memory_mode_uses_online_depth(
++            memory_mode
++        )
++        self.estimator = (
++            _init_registration_estimator(
++                args,
++                device=_rank_local_cuda_device() or self.model.pipe.device,
++            )
++            if needs_depth
++            else None
++        )
++        self.data = next(iter(self.dataloader))
++        if self.data.get("needs_vae_materialization") or self.data.get(
++            "needs_first_latent_materialization"
++        ):
++            with self.timing.scope("distilled_resident_inference.materialize"):
++                self.data = self.model._materialize_data(self.data)
++
++        history_latents = (
++            self.model._ensure_batched_latents(self.data["clean_latents"])
++            .detach()
++            .cpu()
++        )
++        self.memory_visualization_path = str(
++            getattr(args, "causal_memory_visualization_path", "") or ""
++        )
++        self._diagnostic_generated_frames = []
++        self._diagnostic_mosaic_frames = []
++        self._diagnostic_mosaic_anchor = None
++        self._diagnostic_mosaic_chunks = []
++        if self.memory_visualization_path:
++            self.memory_visualization_path = os.path.abspath(
++                self.memory_visualization_path
++            )
++            os.makedirs(
++                os.path.dirname(self.memory_visualization_path) or ".",
++                exist_ok=True,
++            )
++            self._diagnostic_mosaic_anchor = history_latents[:, :, -1:].clone()
++            anchor_frames = _decode_latents_to_numpy_frames(
++                self.model.pipe,
++                self._diagnostic_mosaic_anchor,
++                self.model.pipe.device,
++                tiled=bool(getattr(self.model, "vae_decode_tiled", False)),
++            )
++            self._diagnostic_generated_frames.extend(
++                np.asarray(frame).copy() for frame in anchor_frames
++            )
++            self._diagnostic_mosaic_frames.extend(
++                np.asarray(frame).copy() for frame in anchor_frames
++            )
++        self.latent_window_size = int(self.data["noisy_latent_indices"].shape[-1])
++        self.latent_h, self.latent_w = history_latents.shape[-2:]
++        self.height = int(self.latent_h) * 16
++        self.width = int(self.latent_w) * 16
++        self.handler = (
++            _build_handler(
++                self.data,
++                args,
++                height=self.height,
++                width=self.width,
++                latent_h=self.latent_h,
++                latent_w=self.latent_w,
++                estimator=self.estimator,
++            )
++            if needs_pool
++            else None
++        )
++        if self.handler is not None and hasattr(self.handler, "set_timing_reporter"):
++            self.handler.set_timing_reporter(self.timing)
++
++        iterator = _iter_causal_kv_rollout(
++            self.model,
++            args,
++            self.data,
++            input_dataset,
++            self.handler,
++            history_latents,
++            self.latent_h,
++            self.latent_w,
++            self.height,
++            self.width,
++            bool(getattr(self.model, "vae_decode_tiled", False)),
++            int(args.num_validation_blocks),
++            self.latent_window_size,
++            self.use_mosaic,
++            0,
++            accelerator=accelerator,
++            decode_output_chunks=True,
++            interactive_camera=bool(interactive_camera),
++        )
++        self.rollout = ResidentCausalRollout(iterator)
++        self.interactive_camera = bool(interactive_camera)
++        self.closed = False
++
++    @property
++    def done(self):
++        return self.rollout.done
++
++    @torch.no_grad()
++    def step(self, camera_update=None):
++        if self.closed:
++            raise RuntimeError("distilled resident inference is closed")
++        chunk = self.rollout.step(camera_update=camera_update)
++        diagnostic_paths = self._update_memory_diagnostics(chunk)
++        memory_selection = dict(chunk.get("memory_selection", {}))
++        if diagnostic_paths:
++            memory_selection["memory_visualization"] = diagnostic_paths
++        return {
++            "video": chunk["frames"],
++            "generated_frame_count": int(chunk["generated_frame_count"]),
++            "history_cursor_after": int(chunk["history_cursor_after"]),
++            "memory_selection": memory_selection,
++            "state_digest": (
++                f"chunk={int(chunk['chunk_idx'])};"
++                f"cursor={int(chunk['history_cursor_after'])};"
++                f"kv={int(chunk.get('memory_selection', {}).get('rolling_kv_frame_count', 0))}"
++            ),
++            "native_chunk": chunk,
++        }
++
++    def _update_memory_diagnostics(self, chunk):
++        if not self.memory_visualization_path:
++            return None
++        mosaic_chunk = chunk.get("mosaic_latents")
++        if mosaic_chunk is None:
++            raise RuntimeError(
++                "resident memory visualization requires per-chunk mosaic latents"
++            )
++        self._diagnostic_generated_frames.extend(
++            np.asarray(frame).copy() for frame in chunk["frames"]
++        )
++        mosaic_chunk = mosaic_chunk.detach().cpu()
++        self._diagnostic_mosaic_chunks.append(mosaic_chunk)
++        mosaic_history = torch.cat(
++            [self._diagnostic_mosaic_anchor] + self._diagnostic_mosaic_chunks,
++            dim=2,
++        )
++        decoded_history = _decode_latents_to_numpy_frames(
++            self.model.pipe,
++            mosaic_history,
++            self.model.pipe.device,
++            tiled=bool(getattr(self.model, "vae_decode_tiled", False)),
++        )
++        self._diagnostic_mosaic_frames = [
++            np.asarray(frame).copy() for frame in decoded_history
++        ]
++        generated_frames = list(self._diagnostic_generated_frames)
++        mosaic_frames = list(self._diagnostic_mosaic_frames)
++        if len(mosaic_frames) != len(generated_frames):
++            raise RuntimeError(
++                "resident memory visualization frame mismatch: "
++                f"generated={len(generated_frames)}, mosaic={len(mosaic_frames)}"
++            )
++        trace_path, latent_path = _write_memory_diagnostics(
++            self.memory_visualization_path,
++            self.data,
++            generated_frames,
++            mosaic_frames,
++            mosaic_history,
++        )
++        return {
++            "video": self.memory_visualization_path,
++            "trace": trace_path,
++            "mosaic_latents": latent_path,
++            "frame_count": len(generated_frames),
++        }
++
++    def close(self):
++        if self.closed:
++            return
++        self.rollout.close()
++        self.estimator = None
++        gc.collect()
++        _release_cached_memory()
++        try:
++            self.timing.finish_record()
++        except Exception:
++            pass
++        self.closed = True
++
++
+ @torch.no_grad()
+ def run_distilled_inference(
+     accelerator,
+@@ -129,7 +428,7 @@ def run_distilled_inference(
+         if handler is not None and hasattr(handler, "set_timing_reporter"):
+             handler.set_timing_reporter(timing)
+ 
+-        history_latents, _ = _run_causal_kv_rollout(
++        history_latents, mosaic_latent_history = _run_causal_kv_rollout(
+             unwrapped_model,
+             args,
+             data,
+@@ -153,9 +452,35 @@ def run_distilled_inference(
+             unwrapped_model.pipe.device,
+             tiled=bool(getattr(unwrapped_model, "vae_decode_tiled", False)),
+         )
++        memory_visualization_path = str(
++            getattr(args, "causal_memory_visualization_path", "") or ""
++        )
++        mosaic_frames = None
++        if memory_visualization_path:
++            mosaic_frames = _decode_latents_to_numpy_frames(
++                unwrapped_model.pipe,
++                mosaic_latent_history,
++                unwrapped_model.pipe.device,
++                tiled=bool(getattr(unwrapped_model, "vae_decode_tiled", False)),
++            )
+         if accelerator.is_main_process:
+             _write_video(output_file, list(frames))
+             print(f"[distilled] saved {output_file}", flush=True)
++            if memory_visualization_path:
++                memory_visualization_path = os.path.abspath(memory_visualization_path)
++                os.makedirs(os.path.dirname(memory_visualization_path) or ".", exist_ok=True)
++                trace_path, latent_path = _write_memory_diagnostics(
++                    memory_visualization_path,
++                    data,
++                    list(frames),
++                    list(mosaic_frames),
++                    mosaic_latent_history,
++                )
++                print(
++                    "[distilled] saved memory diagnostics: "
++                    f"{memory_visualization_path}, {trace_path}, {latent_path}",
++                    flush=True,
++                )
+     finally:
+         estimator = None
+         gc.collect()
+diff --git a/examples/wanvideo/pipeline/mosaic/causal_memory.py b/examples/wanvideo/pipeline/mosaic/causal_memory.py
+index bae2162..9953ead 100644
+--- a/examples/wanvideo/pipeline/mosaic/causal_memory.py
++++ b/examples/wanvideo/pipeline/mosaic/causal_memory.py
+@@ -140,6 +140,22 @@ def _generated_memory_query_kwargs_from_args(args):
+                 or 2
+             ),
+         ),
++        "pose_coverage_pool_size": max(
++            0,
++            int(
++                _get_first_arg_value(
++                    args, "mosaic_pose_coverage_pool_size", default=20
++                )
++                or 0
++            ),
++        ),
++        "pose_coverage_max_view_angle_deg": float(
++            _get_first_arg_value(
++                args,
++                "mosaic_pose_coverage_max_view_angle_deg",
++                default=75.0,
++            )
++        ),
+         "query_reference_frame": int(
+             _get_first_arg_value(args, "mosaic_query_reference_frame", default=4)
+             or 4
+@@ -615,6 +631,110 @@ def _candidate_history_block_start(frame_id):
+         return None
+     return (frame_id // 4) * 4
+ 
++
++def _generated_chunk_appearance_stats(frames, spatial_stride=4):
++    """Return inexpensive low-frequency and detail statistics for RGB frames."""
++    arr = np.asarray(frames)
++    if arr.ndim != 4 or arr.shape[-1] < 3:
++        raise ValueError(
++            "appearance statistics expect (T,H,W,3) frames, "
++            f"got {tuple(arr.shape)}."
++        )
++    stride = max(1, int(spatial_stride))
++    rgb = arr[:, ::stride, ::stride, :3].astype(np.float32, copy=False)
++    red, green, blue = rgb[..., 0], rgb[..., 1], rgb[..., 2]
++    luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue
++    detail_scores = []
++    if luma.shape[1] >= 3 and luma.shape[2] >= 3:
++        for frame in luma:
++            lap = (
++                -4.0 * frame[1:-1, 1:-1]
++                + frame[:-2, 1:-1]
++                + frame[2:, 1:-1]
++                + frame[1:-1, :-2]
++                + frame[1:-1, 2:]
++            )
++            detail_scores.append(float(np.var(lap)))
++    channel_max = rgb.max(axis=-1)
++    channel_min = rgb.min(axis=-1)
++    saturation = np.where(
++        channel_max > 1e-6,
++        (channel_max - channel_min) / np.maximum(channel_max, 1e-6),
++        0.0,
++    )
++    return {
++        "detail": float(np.mean(detail_scores)) if detail_scores else 0.0,
++        "contrast": float(np.std(luma)),
++        "color": [
++            float(np.mean(luma)),
++            float(np.mean(red - green)),
++            float(np.mean(blue - green)),
++        ],
++        "saturation": float(np.mean(saturation)),
++    }
++
++
++def _generated_chunk_appearance_quality(
++    current,
++    trusted,
++    anchor,
++    *,
++    mosaic_valid_ratio=1.0,
++):
++    """Score whether a generated chunk is safe to reuse as appearance context."""
++    eps = 1e-6
++    detail_ratio = float(current["detail"]) / max(float(trusted["detail"]), eps)
++    contrast_ratio = float(current["contrast"]) / max(
++        float(trusted["contrast"]), eps
++    )
++    current_color = np.asarray(current["color"], dtype=np.float64)
++    trusted_color = np.asarray(trusted["color"], dtype=np.float64)
++    anchor_color = np.asarray(anchor["color"], dtype=np.float64)
++    local_color_delta = float(np.linalg.norm(current_color - trusted_color))
++    anchor_color_delta = float(np.linalg.norm(current_color - anchor_color))
++
++    detail_factor = float(np.clip(detail_ratio / 0.65, 0.0, 1.0))
++    contrast_factor = float(np.clip(contrast_ratio / 0.75, 0.0, 1.0))
++    color_delta = max(local_color_delta, 0.35 * anchor_color_delta)
++    color_factor = float(np.exp(-color_delta / 30.0))
++    valid_factor = 0.5 + 0.5 * float(
++        np.clip(float(mosaic_valid_ratio) / 0.7, 0.0, 1.0)
++    )
++    quality = (
++        detail_factor ** 0.45
++        * contrast_factor ** 0.20
++        * color_factor ** 0.25
++        * valid_factor ** 0.10
++    )
++    return {
++        "quality": float(np.clip(quality, 0.0, 1.0)),
++        "detail_ratio": detail_ratio,
++        "contrast_ratio": contrast_ratio,
++        "local_color_delta": local_color_delta,
++        "anchor_color_delta": anchor_color_delta,
++        "mosaic_valid_ratio": float(mosaic_valid_ratio),
++        "detail_factor": detail_factor,
++        "contrast_factor": contrast_factor,
++        "color_factor": color_factor,
++        "valid_factor": valid_factor,
++    }
++
++
++def _appearance_stats_ema(previous, current, alpha):
++    alpha = float(np.clip(float(alpha), 0.0, 1.0))
++    return {
++        "detail": (1.0 - alpha) * float(previous["detail"])
++        + alpha * float(current["detail"]),
++        "contrast": (1.0 - alpha) * float(previous["contrast"])
++        + alpha * float(current["contrast"]),
++        "color": (
++            (1.0 - alpha) * np.asarray(previous["color"], dtype=np.float64)
++            + alpha * np.asarray(current["color"], dtype=np.float64)
++        ).tolist(),
++        "saturation": (1.0 - alpha) * float(previous["saturation"])
++        + alpha * float(current["saturation"]),
++    }
++
+ class _CausalKVDynamicContextPool:
+     """Chunk-level per3 visual context pool for KV validation/sampling.
+ 
+@@ -773,6 +893,7 @@ class _CausalKVDynamicContextPool:
+         *,
+         pipe,
+         generated_frames,
++        generated_latents=None,
+         chunk_idx,
+         frames_per_chunk,
+         rgb_start,
+@@ -781,6 +902,8 @@ class _CausalKVDynamicContextPool:
+         device,
+         tiled=False,
+         source="generated",
++        appearance_quality=1.0,
++        minimum_quality=0.0,
+     ):
+         frames = np.asarray(generated_frames)
+         if frames.ndim != 4 or frames.shape[-1] != 3:
+@@ -794,28 +917,75 @@ class _CausalKVDynamicContextPool:
+                 "generated context registration frame count mismatch: "
+                 f"{int(frames.shape[0])} vs expected {cs * 4}."
+             )
+-        if self.last_rgb_frame is None:
+-            raise RuntimeError(
+-                "dynamic context pool has no previous RGB frame for 5-frame "
+-                "generated context encode."
+-            )
+         source = str(source or "generated").strip().lower()
+         if source not in {"generated", "gt_prefix"}:
+             raise ValueError(
+                 "dynamic context registration source must be generated or "
+                 f"gt_prefix, got {source!r}."
+             )
+-        windows = []
+-        for local_i in range(cs):
+-            s = int(local_i) * 4
+-            prev = self.last_rgb_frame if local_i == 0 else frames[s - 1]
+-            windows.append(np.concatenate([prev[None, ...], frames[s : s + 4]], axis=0))
+-        latents = _encode_context_windows_to_latents(
+-            pipe, windows, device=device, tiled=tiled
+-        )
++        appearance_quality = float(np.clip(float(appearance_quality), 0.0, 1.0))
++        minimum_quality = float(np.clip(float(minimum_quality), 0.0, 1.0))
++        if source == "generated" and appearance_quality < minimum_quality:
++            self.last_rgb_frame = np.ascontiguousarray(frames[-1])
++            result = self._stage_generated_context_entries([], chunk_idx=chunk_idx)
++            result.update(
++                {
++                    "quality_gated": True,
++                    "appearance_quality": appearance_quality,
++                    "used_dense_latents": False,
++                }
++            )
++            return result
++
++        used_dense_latents = generated_latents is not None
++        if used_dense_latents:
++            if source != "generated":
++                raise ValueError(
++                    "generated_latents may only be supplied for generated context"
++                )
++            latents = generated_latents.detach().to(
++                device="cpu", dtype=torch.float32
++            )
++            if latents.ndim == 4:
++                latents = latents.unsqueeze(0)
++            if latents.ndim != 5 or int(latents.shape[0]) != 1:
++                raise RuntimeError(
++                    "generated context dense latents must have shape "
++                    f"(1,C,T,H,W), got {tuple(latents.shape)}."
++                )
++            if int(latents.shape[2]) != cs:
++                raise RuntimeError(
++                    "generated context dense latent count mismatch: "
++                    f"{int(latents.shape[2])} vs expected {cs}."
++                )
++            latents = latents.contiguous()
++        else:
++            if self.last_rgb_frame is None:
++                raise RuntimeError(
++                    "dynamic context pool has no previous RGB frame for "
++                    "5-frame generated context encode."
++                )
++            windows = []
++            for local_i in range(cs):
++                s = int(local_i) * 4
++                prev = self.last_rgb_frame if local_i == 0 else frames[s - 1]
++                windows.append(
++                    np.concatenate([prev[None, ...], frames[s : s + 4]], axis=0)
++                )
++            latents = _encode_context_windows_to_latents(
++                pipe, windows, device=device, tiled=tiled
++            )
+         if latents is None:
+             self.last_rgb_frame = np.ascontiguousarray(frames[-1])
+-            return self._stage_generated_context_entries([], chunk_idx=chunk_idx)
++            result = self._stage_generated_context_entries([], chunk_idx=chunk_idx)
++            result.update(
++                {
++                    "quality_gated": False,
++                    "appearance_quality": appearance_quality,
++                    "used_dense_latents": used_dense_latents,
++                }
++            )
++            return result
+         extr = np.asarray(full_noisy_extr, dtype=np.float32)
+         intr = np.asarray(full_noisy_intr, dtype=np.float32)
+         entries = []
+@@ -842,13 +1012,22 @@ class _CausalKVDynamicContextPool:
+                     "rep_extrinsic": extr[block_s + min(1, block_e - block_s - 1)],
+                     "extrinsic_block": extr[block_s:block_e],
+                     "intrinsic_block": intr[block_s:block_e],
++                    "appearance_quality": appearance_quality,
+                 }
+             )
+         self.last_rgb_frame = np.ascontiguousarray(frames[-1])
+-        return self._stage_generated_context_entries(
++        result = self._stage_generated_context_entries(
+             entries,
+             chunk_idx=chunk_idx,
+         )
++        result.update(
++            {
++                "quality_gated": False,
++                "appearance_quality": appearance_quality,
++                "used_dense_latents": used_dense_latents,
++            }
++        )
++        return result
+ 
+ def _causal_kv_first_noisy_actual_time(generating_first_frame_idx, anchor_actual_time):
+     return max(
+@@ -953,6 +1132,19 @@ def _build_initial_causal_kv_dynamic_context_pool(
+     )
+     base_total = min(base_total, int(w2c.shape[0]))
+     candidate_groups = _candidate_groups_to_lists(fused.get("candidate_frame_ids") or [])
++    if bool(getattr(args, "causal_validation_full_context_memory", False)):
++        # The resident path may receive a synthetic/online Context workspace
++        # whose offline candidate list is empty. Preserve the native per-3
++        # selection contract by making every complete 4-RGB-frame history
++        # block a candidate, then let the pool choose at most one block per
++        # generation chunk. This is a candidate expansion, not KV duplication.
++        if not candidate_groups:
++            candidate_groups = [
++                [int(block_start)]
++                for block_start in range(0, max(0, G - 3), 4)
++            ]
++        else:
++            candidate_groups = [list(group) for group in candidate_groups]
+     selected = []
+     used_blocks = set()
+     latest_block_start = max(0, G - 4)
+diff --git a/examples/wanvideo/pipeline/mosaic/causal_rollout.py b/examples/wanvideo/pipeline/mosaic/causal_rollout.py
+index dec64ed..71f3b6a 100644
+--- a/examples/wanvideo/pipeline/mosaic/causal_rollout.py
++++ b/examples/wanvideo/pipeline/mosaic/causal_rollout.py
+@@ -33,9 +33,13 @@ from .causal_memory import (
+     _build_initial_causal_kv_dynamic_context_pool,
+     _camera_array_for_frame_count,
+     _decode_generated_chunk_from_prefix_latents,
++    _encode_context_windows_to_latents,
+     _generated_memory_chunk_has_future_consumer,
+     _generated_memory_publish_interval_from_args,
+     _generated_memory_query_kwargs_from_args,
++    _generated_chunk_appearance_quality,
++    _generated_chunk_appearance_stats,
++    _appearance_stats_ema,
+     _is_da3_insufficient_non_sky_error,
+     _maybe_gather_zero3_module,
+     _read_validation_gt_depth_frames,
+@@ -49,11 +53,198 @@ from .causal_memory import (
+ )
+ from .cleanup import _release_cached_memory
+ from .video_io import (
++    _build_validation_neighbor_window_memory_latents,
+     _decode_latents_to_numpy_frames,
+     _encode_frames_per_frame,
+     _read_video_gt_frames,
++    _record_validation_candidate_frames,
+ )
+ 
++
++def _encode_teacher_forced_context(
++    pipe,
++    frames,
++    *,
++    frames_per_chunk,
++    device,
++    tiled=False,
++):
++    """Encode GT Context into native causal latents for clean cache replay.
++
++    The first RGB frame is the clean C0 anchor. Every following group of four
++    RGB frames is encoded through the same five-frame window used by native
++    generated dynamic context: ``[previous_rgb, current_rgb_0..3]``. The final
++    group is edge-padded so prefill consumes the complete Context boundary.
++    """
++    frames = np.asarray(frames)
++    if frames.ndim != 4 or int(frames.shape[-1]) != 3:
++        raise RuntimeError(
++            "teacher-forced Context expects (T,H,W,3) RGB frames, "
++            f"got {tuple(frames.shape)}."
++        )
++    if int(frames.shape[0]) < 2:
++        raise RuntimeError("teacher-forced Context requires at least two RGB frames")
++    cs = int(frames_per_chunk)
++    if cs <= 0:
++        raise ValueError(f"frames_per_chunk must be positive, got {cs}")
++    target_frames = np.ascontiguousarray(frames[1:])
++    latent_count = int(math.ceil(int(target_frames.shape[0]) / 4.0))
++    padded_rgb_count = latent_count * 4
++    padding = padded_rgb_count - int(target_frames.shape[0])
++    if padding:
++        target_frames = np.concatenate(
++            [target_frames, np.repeat(target_frames[-1:], padding, axis=0)],
++            axis=0,
++        )
++    windows = []
++    for latent_idx in range(latent_count):
++        start = latent_idx * 4
++        previous = frames[0] if latent_idx == 0 else target_frames[start - 1]
++        windows.append(
++            np.concatenate(
++                [previous[None, ...], target_frames[start : start + 4]], axis=0
++            )
++        )
++    teacher_latents = _encode_context_windows_to_latents(
++        pipe,
++        windows,
++        device=device,
++        tiled=tiled,
++    )
++    if teacher_latents is None or int(teacher_latents.shape[2]) != latent_count:
++        raise RuntimeError(
++            "teacher-forced Context VAE latent count mismatch: "
++            f"expected={latent_count}, observed="
++            f"{None if teacher_latents is None else int(teacher_latents.shape[2])}."
++        )
++    chunk_latent_count = cs
++    chunk_count = int(math.ceil(latent_count / float(chunk_latent_count)))
++    padded_latent_count = chunk_count * chunk_latent_count
++    latent_padding = padded_latent_count - latent_count
++    if latent_padding:
++        teacher_latents = torch.cat(
++            [
++                teacher_latents,
++                teacher_latents[:, :, -1:].repeat(1, 1, latent_padding, 1, 1),
++            ],
++            dim=2,
++        )
++        rgb_padding = latent_padding * 4
++        target_frames = np.concatenate(
++            [target_frames, np.repeat(target_frames[-1:], rgb_padding, axis=0)],
++            axis=0,
++        )
++        padding += rgb_padding
++    return {
++        "anchor_frame": np.ascontiguousarray(frames[:1]),
++        "target_frames": np.ascontiguousarray(target_frames),
++        "latents": teacher_latents.contiguous(),
++        "latent_count": int(teacher_latents.shape[2]),
++        "chunk_count": chunk_count,
++        "padded_rgb_count": int(target_frames.shape[0]),
++        "padding_rgb_count": int(padding),
++    }
++
++
++def _decode_native_resident_chunk(
++    pipe,
++    initial_c0,
++    all_clean,
++    *,
++    chunk_idx,
++    chunk_size,
++    device,
++    tiled=False,
++):
++    """Decode the accumulated prefix exactly like native batch inference.
++
++    The resident API still returns only the current chunk, but decoding a
++    one-latent anchor plus the current chunk creates a fresh VAE boundary every
++    12 RGB frames. Native distilled inference decodes C0 plus the complete
++    generated latent history in one call, so reproduce that contract here and
++    slice the current chunk from the result.
++    """
++    prefix_latents = torch.cat(
++        [initial_c0.detach().cpu()] + list(all_clean), dim=2
++    )
++    prefix_frames = _decode_latents_to_numpy_frames(
++        pipe,
++        prefix_latents,
++        device,
++        tiled=tiled,
++    )
++    frames_per_chunk = int(chunk_size) * 4
++    frame_start = 1 + int(chunk_idx) * frames_per_chunk
++    frame_end = frame_start + frames_per_chunk
++    if int(prefix_frames.shape[0]) < frame_end:
++        raise RuntimeError(
++            "resident native-prefix decode returned too few frames: "
++            f"observed={int(prefix_frames.shape[0])}, required={frame_end}."
++        )
++    return prefix_frames[frame_start:frame_end]
++
++
++def _register_source_sequence_batched(
++    handler,
++    device,
++    frames,
++    *,
++    extrinsics,
++    intrinsics,
++    depths=None,
++    start_index=0,
++    force_using_input_extrinics=True,
++):
++    """Register source prefixes on a configurable DA3 device and batch size.
++
++    DA3's memory footprint scales with the number of input RGB frames.  The
++    handler already supports contiguous incremental registration, so split
++    only the estimator call while preserving the same global frame indices and
++    memory ordering. A zero batch size keeps the historical single-call path;
++    a separate registration device prevents that full call from competing with
++    the resident generation model.
++    """
++    batch_size = int(
++        os.environ.get("WORLDFOUNDRY_DA3_REGISTRATION_BATCH_FRAMES", "0") or "0"
++    )
++    registration_device = str(
++        os.environ.get("WORLDFOUNDRY_DA3_REGISTRATION_DEVICE", "") or ""
++    ).strip()
++    registration_device = registration_device or device
++    if registration_device != device:
++        print(
++            f"[causal-kv] DA3 source registration device: "
++            f"model={device} registration={registration_device}",
++            flush=True,
++        )
++    if batch_size <= 0 or len(frames) <= batch_size:
++        return handler.register_source_sequence(
++            registration_device,
++            frames,
++            extrinsics=extrinsics,
++            intrinsics=intrinsics,
++            depths=depths,
++            start_index=start_index,
++            force_using_input_extrinics=force_using_input_extrinics,
++        )
++    print(
++        f"[causal-kv] DA3 source registration batching: frames={len(frames)} "
++        f"batch_size={batch_size}",
++        flush=True,
++    )
++    for offset in range(0, len(frames), batch_size):
++        end = min(offset + batch_size, len(frames))
++        handler.register_source_sequence(
++            registration_device,
++            frames[offset:end],
++            extrinsics=np.asarray(extrinsics)[offset:end],
++            intrinsics=np.asarray(intrinsics)[offset:end] if intrinsics is not None else None,
++            depths=np.asarray(depths)[offset:end] if depths is not None else None,
++            start_index=int(start_index) + offset,
++            force_using_input_extrinics=force_using_input_extrinics,
++        )
++    return None
++
+ def _causal_kv_cache_copy(cache_list):
+     """Return a shallow structural copy so write_cache cannot mutate inputs."""
+     out = []
+@@ -265,6 +456,25 @@ def _causal_kv_trim_rolling_latents(
+         out = out.index_select(2, keep_idx).contiguous()
+     return out
+ 
++
++def _same_pose_refresh_due(chunk_idx, interval_chunks):
++    """Return whether the just-completed 1-based chunk interval should refresh."""
++    interval_chunks = int(interval_chunks)
++    return interval_chunks > 0 and (int(chunk_idx) + 1) % interval_chunks == 0
++
++
++def _same_pose_refresh_latent_stats(before, after):
++    """Cheap diagnostics that do not require an extra VAE decode."""
++    before_f = before.detach().float()
++    after_f = after.detach().float()
++    denom = before_f.norm().clamp_min(1e-12)
++    return {
++        "pre_std": float(before_f.std().item()),
++        "post_std": float(after_f.std().item()),
++        "relative_delta": float((after_f - before_f).norm().div(denom).item()),
++    }
++
++
+ def _causal_dmd_validation_transition(
+     scheduler,
+     model_output,
+@@ -301,7 +511,84 @@ def _causal_validation_resolve_section_prompts(section_prompts, fallback_prompt,
+         prompts = [prompts[0] for _ in prompts]
+     return prompts
+ 
+-def _run_causal_kv_rollout(
++
++class ResidentCausalRollout:
++    """Advance one already-initialized causal rollout chunk at a time.
++
++    The wrapped generator owns all model-native state, including rolling KV,
++    latent history, dynamic visual context and Patch/Mosaic memory.  No tensor
++    state is reconstructed between :meth:`step` calls.
++    """
++
++    def __init__(self, iterator):
++        self._iterator = iter(iterator)
++        self.chunk_index = 0
++        self.history_cursor = 0
++        self.done = False
++        self.result = None
++
++    def _finish(self, stop):
++        self.done = True
++        self.result = stop.value
++
++    def step(self, camera_update=None):
++        if self.done:
++            raise StopIteration("causal rollout is complete")
++        try:
++            chunk = next(self._iterator)
++        except StopIteration as stop:
++            self._finish(stop)
++            raise
++        if isinstance(chunk, dict) and chunk.get("event") == "camera_request":
++            if camera_update is None:
++                raise RuntimeError(
++                    "interactive causal rollout requires a camera update for "
++                    f"chunk={int(chunk.get('chunk_idx', -1))}."
++                )
++            try:
++                chunk = self._iterator.send(camera_update)
++            except StopIteration as stop:
++                self._finish(stop)
++                raise RuntimeError(
++                    "interactive causal rollout ended while applying a camera update"
++                ) from stop
++        if not isinstance(chunk, dict):
++            raise RuntimeError("resident causal rollout must yield a mapping")
++        expected = int(self.chunk_index)
++        observed = int(chunk.get("chunk_idx", -1))
++        if observed != expected:
++            raise RuntimeError(
++                "resident causal rollout chunk order diverged: "
++                f"expected={expected}, observed={observed}."
++            )
++        cursor_after = int(chunk.get("history_cursor_after", 0))
++        if cursor_after <= self.history_cursor:
++            raise RuntimeError(
++                "resident causal rollout history cursor did not advance: "
++                f"before={self.history_cursor}, after={cursor_after}."
++            )
++        self.chunk_index += 1
++        self.history_cursor = cursor_after
++        if bool(chunk.get("is_last_chunk", False)):
++            try:
++                extra = next(self._iterator)
++            except StopIteration as stop:
++                self._finish(stop)
++            else:
++                raise RuntimeError(
++                    "resident causal rollout yielded data after its final chunk: "
++                    f"{extra!r}"
++                )
++        return chunk
++
++    def close(self):
++        close = getattr(self._iterator, "close", None)
++        if callable(close):
++            close()
++        self.done = True
++
++
++def _iter_causal_kv_rollout(
+     unwrapped_model,
+     args,
+     data,
+@@ -318,8 +605,10 @@ def _run_causal_kv_rollout(
+     use_mosaic,
+     batch_idx,
+     accelerator=None,
++    decode_output_chunks=False,
++    interactive_camera=False,
+ ):
+-    """Run Stage3 few-step generation with a bounded causal KV cache.
++    """Yield Stage3 chunks while retaining the complete causal rollout state.
+ 
+     C0 bootstraps the memory bank, every generated chunk is registered back into
+     ``FrustumHandler``, and later chunks query only memory accumulated so far.
+@@ -336,6 +625,19 @@ def _run_causal_kv_rollout(
+         )
+     chunks_per_window = latent_window_size // cs
+     ccc = int(getattr(args, "causal_context_chunks", 0) or 0) or chunks_per_window
++    same_pose_refresh_interval = int(
++        getattr(args, "causal_same_pose_refresh_interval_chunks", 0) or 0
++    )
++    same_pose_refresh_anchor_only_steps = int(
++        getattr(args, "causal_same_pose_refresh_anchor_only_steps", 1) or 0
++    )
++    same_pose_refresh_reset_rolling = bool(
++        getattr(args, "causal_same_pose_refresh_reset_rolling", True)
++    )
++    if same_pose_refresh_interval < 0:
++        raise ValueError("causal_same_pose_refresh_interval_chunks must be >= 0")
++    if same_pose_refresh_anchor_only_steps < 0:
++        raise ValueError("causal_same_pose_refresh_anchor_only_steps must be >= 0")
+     total_chunks = num_validation_blocks * chunks_per_window
+     total_n = total_chunks * cs
+     fixed_initial_anchor = bool(
+@@ -382,6 +684,21 @@ def _run_causal_kv_rollout(
+             "--causal_validation_t2v_no_ref is a no-reference T2V diagnostic "
+             "and must run with --causal_validation_memory_mode empty."
+         )
++    if same_pose_refresh_interval and t2v_no_ref:
++        raise ValueError("same-pose refresh requires an initial clean anchor")
++    if same_pose_refresh_interval and fixed_initial_anchor:
++        raise ValueError(
++            "same-pose refresh rolling reset is incompatible with a fixed initial "
++            "rolling anchor"
++        )
++    if (
++        same_pose_refresh_interval
++        and memory_context_selection_policy == "nonlocal_oldest"
++    ):
++        raise ValueError(
++            "same-pose refresh currently supports the legacy memory-context "
++            "selection policy only"
++        )
+     cfg_scale = _effective_validation_cfg_scale(
+         args,
+         dmd_validation=True,
+@@ -392,7 +709,42 @@ def _run_causal_kv_rollout(
+     )
+     pending_generated_memory = []
+     published_rgb_count = 0
++    # ``published_rgb_count`` also records the number of RGB frames seeded by
++    # a full Context.  Query camera arrays, however, are generated-window
++    # local. Keep a separate cursor so Context-as-generated-history does not
++    # slice the generated query trajectory past its end.
++    generated_published_rgb_count = 0
+     memory_disabled_after_c0_failure = False
++    dense_latent_writeback = bool(
++        getattr(args, "causal_dense_latent_writeback", False)
++    )
++    dense_latent_dynamic_context = bool(
++        getattr(args, "causal_dense_latent_dynamic_context", False)
++    )
++    dense_latent_max_trans_m = float(
++        getattr(args, "causal_dense_latent_max_trans_m", 0.25)
++    )
++    dense_latent_max_rot_deg = float(
++        getattr(args, "causal_dense_latent_max_rot_deg", 5.0)
++    )
++    quality_weighted_retrieval = bool(
++        getattr(args, "causal_quality_weighted_retrieval", False)
++    )
++    quality_gated_context = bool(
++        getattr(args, "causal_quality_gated_context", False)
++    )
++    quality_retrieval_floor = float(
++        getattr(args, "causal_quality_retrieval_floor", 0.2)
++    )
++    quality_context_threshold = float(
++        getattr(args, "causal_quality_context_threshold", 0.5)
++    )
++    quality_trusted_ema = float(
++        getattr(args, "causal_quality_trusted_ema", 0.05)
++    )
++    appearance_anchor_stats = None
++    appearance_trusted_stats = None
++    mosaic_source_appearance_quality = []
+     memory_registration_stats = {
+         "requested_mode": validation_memory_mode,
+         "c0_registered": None,
+@@ -401,10 +753,50 @@ def _run_causal_kv_rollout(
+         "generated_registration_failure_chunks": [],
+         "generated_published_chunks": [],
+         "gt_prefix_published_chunks": [],
++        "context_prefix_published_chunks": [],
+         "published_rgb_count": 0,
+         "memory_disabled_after_c0_failure": False,
++        "dense_latent_writeback": dense_latent_writeback,
++        "dense_latent_dynamic_context": dense_latent_dynamic_context,
++        "dense_writeback_chunks": [],
++        "dense_context_chunks": [],
++        "quality_weighted_retrieval": quality_weighted_retrieval,
++        "quality_gated_context": quality_gated_context,
++        "quality_gated_context_chunks": [],
++        "appearance_quality_chunks": [],
+     }
+     data["_causal_validation_memory_stats"] = memory_registration_stats
++    memory_diagnostics = None
++    if bool(getattr(args, "causal_memory_visualization_path", "")):
++        memory_diagnostics = {
++            "candidate_frames_by_id": {},
++            "candidate_groups": [],
++            "latent_groups": [],
++            "chunk_size_latents": int(cs),
++            "rgb_frames_per_latent": 4,
++        }
++        data["_causal_memory_diagnostics"] = memory_diagnostics
++    full_context_memory = bool(
++        getattr(args, "causal_validation_full_context_memory", False)
++    )
++    context_as_generated_history = bool(
++        getattr(args, "causal_validation_context_as_generated_history", False)
++    )
++    if context_as_generated_history and validation_empty_memory:
++        raise ValueError(
++            "context_as_generated_history requires a Mosaic memory mode"
++        )
++    full_context_memory_stats = {
++        "enabled": full_context_memory,
++        "registered": False,
++        "frame_count": 0,
++        "mosaic_latent_count": 0,
++        "registration_failures": 0,
++        "selection_policy": "frustum_candidate_selector",
++        "context_as_generated_history": context_as_generated_history,
++        "context_prefix_published_chunks": [],
++    }
++    data["_causal_full_context_memory_stats"] = full_context_memory_stats
+     channels = int(history_latents.shape[1])
+     register_rgb_source = _validation_register_rgb_source(args)
+     register_depth_source = _validation_register_depth_source(args)
+@@ -509,6 +901,81 @@ def _run_causal_kv_rollout(
+         args,
+         accelerator=accelerator,
+     )
++    context_frames = None
++    context_extrinsics = None
++    context_intrinsics = None
++    teacher_context = None
++    teacher_context_latent_count = 0
++    if context_as_generated_history and not validation_empty_memory:
++        context_count = int(
++            (validation_info or {}).get("generating_first_frame_idx", 0) or 0
++        )
++        fused_inputs = data.get("fused_query_inputs") or {}
++        context_w2c = fused_inputs.get("w2c")
++        context_K = fused_inputs.get("memory_K")
++        if context_K is None:
++            context_K = fused_inputs.get("K")
++        if context_count <= 1 or context_w2c is None or context_K is None:
++            raise RuntimeError(
++                "teacher-forced Context replay requires at least two Context "
++                "frames plus fused w2c and memory intrinsics"
++            )
++        context_frames = _read_video_gt_frames(
++            validation_info["video_path"],
++            list(range(context_count)),
++            H_img,
++            W_img,
++        )
++        context_extrinsics = np.asarray(context_w2c, dtype=np.float32)[:context_count]
++        context_K = np.asarray(context_K, dtype=np.float32)
++        if context_K.ndim == 2:
++            context_K = np.repeat(context_K[None], context_count, axis=0)
++        context_intrinsics = context_K[:context_count]
++        teacher_context = _encode_teacher_forced_context(
++            pipe,
++            context_frames,
++            frames_per_chunk=cs,
++            device=device,
++            tiled=vae_decode_tiled,
++        )
++        teacher_context_latent_count = int(teacher_context["latent_count"])
++        initial_c0 = _encode_frames_per_frame(
++            pipe,
++            teacher_context["anchor_frame"],
++            device,
++            tiled=vae_decode_tiled,
++        ).to(device=device, dtype=dtype)
++
++        teacher_rgb_count = int(teacher_context["padded_rgb_count"])
++        teacher_target_intr = np.asarray(context_intrinsics[1:], dtype=np.float32)
++        teacher_target_extr = np.asarray(context_extrinsics[1:], dtype=np.float32)
++        if len(teacher_target_intr) < teacher_rgb_count:
++            pad = teacher_rgb_count - len(teacher_target_intr)
++            teacher_target_intr = np.concatenate(
++                [teacher_target_intr, np.repeat(teacher_target_intr[-1:], pad, axis=0)]
++            )
++            teacher_target_extr = np.concatenate(
++                [teacher_target_extr, np.repeat(teacher_target_extr[-1:], pad, axis=0)]
++            )
++        teacher_context["target_intrinsics"] = teacher_target_intr
++        teacher_context["target_extrinsics"] = teacher_target_extr
++        clean_intr = torch.as_tensor(
++            np.repeat(context_intrinsics[:1], 4, axis=0),
++            device=full_noisy_intr.device,
++            dtype=full_noisy_intr.dtype,
++        )
++        clean_extr = torch.as_tensor(
++            np.repeat(context_extrinsics[:1], 4, axis=0),
++            device=full_noisy_extr.device,
++            dtype=full_noisy_extr.dtype,
++        )
++        print(
++            "[causal-kv][teacher-forcing] prepared GT Context: "
++            f"rgb={context_count}, causal_latents={teacher_context_latent_count}, "
++            f"chunks={teacher_context['chunk_count']}, "
++            f"edge_padding_rgb={teacher_context['padding_rgb_count']}",
++            flush=True,
++        )
+     original_section_prompts = tuple(section_prompts or [prompt or ""])
+     data["_causal_validation_original_section_prompts"] = original_section_prompts
+     section_prompts = _causal_validation_resolve_section_prompts(
+@@ -552,8 +1019,12 @@ def _run_causal_kv_rollout(
+         )
+     )
+     if validation_dynamic_context_enabled:
+-        decoded_c0_frames = _decode_latents_to_numpy_frames(
+-            pipe, initial_c0, device, tiled=vae_decode_tiled
++        decoded_c0_frames = (
++            np.asarray(teacher_context["anchor_frame"])
++            if teacher_context is not None
++            else _decode_latents_to_numpy_frames(
++                pipe, initial_c0, device, tiled=vae_decode_tiled
++            )
+         )
+         if validation_gt_memory:
+             video_path = validation_info.get("video_path")
+@@ -593,6 +1064,16 @@ def _run_causal_kv_rollout(
+             generated_context_publish_interval=memory_publish_interval,
+             tiled=vae_decode_tiled,
+         )
++        if teacher_context is not None and dynamic_context_pool is not None:
++            # Context teacher latents occupy the causal positions immediately
++            # before Eval. Shift the pool's generated-index mapping so Eval
++            # continues that absolute RoPE/PRoPE timeline.
++            dynamic_context_pool.noisy_position_offset += int(
++                teacher_context_latent_count
++            )
++            dynamic_context_pool.noisy_camera_offset += int(
++                teacher_context_latent_count
++            )
+     initial_context_count = (
+         int(dynamic_context_pool.initial_context_count)
+         if dynamic_context_pool is not None
+@@ -637,7 +1118,7 @@ def _run_causal_kv_rollout(
+         if t2v_no_ref:
+             return int(noisy_index)
+         if dynamic_context_pool is None:
+-            return int(noisy_index) + 1
++            return int(noisy_index) + 1 + int(teacher_context_latent_count)
+         return dynamic_context_pool.position_for_noisy_index(noisy_index)
+ 
+     def _noisy_camera_frame(noisy_index):
+@@ -646,7 +1127,7 @@ def _run_causal_kv_rollout(
+         if t2v_no_ref:
+             return max(0, int(noisy_index) - 1)
+         if dynamic_context_pool is None:
+-            return int(noisy_index)
++            return int(noisy_index) + int(teacher_context_latent_count)
+         return dynamic_context_pool.camera_frame_for_noisy_index(noisy_index)
+ 
+     validation_rope_stats = {
+@@ -669,6 +1150,20 @@ def _run_causal_kv_rollout(
+             and getattr(dynamic_context_pool, "force_context_original_anchor", False)
+         ),
+         "fixed_initial_rolling_anchor": bool(fixed_initial_anchor),
++        "same_pose_refresh_interval_chunks": int(same_pose_refresh_interval),
++        "same_pose_refresh_anchor_only_steps": int(
++            same_pose_refresh_anchor_only_steps
++        ),
++        "same_pose_refresh_reset_rolling": bool(
++            same_pose_refresh_reset_rolling
++        ),
++        "same_pose_refresh_chunks": [],
++        "teacher_forced_context": bool(teacher_context is not None),
++        "teacher_context_latent_count": int(teacher_context_latent_count),
++        "teacher_context_chunk_count": int(
++            teacher_context["chunk_count"] if teacher_context is not None else 0
++        ),
++        "teacher_context_cache_fill_chunks": [],
+         "generated_context_published_chunks": [],
+         "chunks": [],
+     }
+@@ -692,6 +1187,31 @@ def _run_causal_kv_rollout(
+             flush=True,
+         )
+ 
++    camera_noisy_intr = full_noisy_intr
++    camera_noisy_extr = full_noisy_extr
++    if teacher_context is not None:
++        camera_noisy_intr = torch.cat(
++            [
++                torch.as_tensor(
++                    teacher_context["target_intrinsics"],
++                    device=full_noisy_intr.device,
++                    dtype=full_noisy_intr.dtype,
++                ),
++                full_noisy_intr,
++            ],
++            dim=0,
++        )
++        camera_noisy_extr = torch.cat(
++            [
++                torch.as_tensor(
++                    teacher_context["target_extrinsics"],
++                    device=full_noisy_extr.device,
++                    dtype=full_noisy_extr.dtype,
++                ),
++                full_noisy_extr,
++            ],
++            dim=0,
++        )
+     camera_info = WAN_VIDEO_PROPE_CAMERA_UNIT.process(
+         pipe=None,
+         use_prope=True,
+@@ -703,8 +1223,8 @@ def _run_causal_kv_rollout(
+         mosaic_frame_count=0,
+         clean_latent_indices_prope_intrinsic=camera_clean_intr,
+         clean_latent_indices_prope_extrinsic=camera_clean_extr,
+-        noisy_latent_indices_prope_intrinsic=full_noisy_intr,
+-        noisy_latent_indices_prope_extrinsic=full_noisy_extr,
++        noisy_latent_indices_prope_intrinsic=camera_noisy_intr,
++        noisy_latent_indices_prope_extrinsic=camera_noisy_extr,
+         trans_scale=getattr(dit, "trans_scale", 50.0),
+     )["camera_info"]
+     # carrier for the mosaic query below (full-trajectory extrinsics)
+@@ -720,6 +1240,7 @@ def _run_causal_kv_rollout(
+     #   empty: diagnosis mode, pass no mosaic latent and skip memory registration.
+     mosaic_query_latents = None
+     mosaic_source_timeline_positions = []
++    mosaic_source_timeline_offset = 1
+     if use_mosaic:
+         if validation_empty_memory:
+             print(
+@@ -769,26 +1290,103 @@ def _run_causal_kv_rollout(
+                     data["info"],
+                     c0_frame_indices,
+                 )
++            if full_context_memory and context_frames is None:
++                context_count = int(
++                    (validation_info or {}).get(
++                        "generating_first_frame_idx", 0
++                    )
++                    or 0
++                )
++                fused_inputs = data.get("fused_query_inputs") or {}
++                context_w2c = fused_inputs.get("w2c")
++                context_K = fused_inputs.get("memory_K")
++                if context_count > 0 and context_w2c is not None:
++                    context_frames = _read_video_gt_frames(
++                        validation_info["video_path"],
++                        list(range(context_count)),
++                        H_img,
++                        W_img,
++                    )
++                    context_extrinsics = np.asarray(context_w2c, dtype=np.float32)[
++                        :context_count
++                    ]
++                    if context_K is None:
++                        context_K = fused_inputs.get("K")
++                    if context_K is None:
++                        raise RuntimeError(
++                            "full Context memory requires fused memory intrinsics"
++                        )
++                    context_K = np.asarray(context_K, dtype=np.float32)
++                    if context_K.ndim == 2:
++                        context_K = np.repeat(context_K[None], context_count, axis=0)
++                    context_intrinsics = context_K[:context_count]
++            register_frames = (
++                context_frames if context_frames is not None else c0_frames
++            )
++            register_extrinsics = (
++                context_extrinsics
++                if context_extrinsics is not None
++                else _camera_array_for_frame_count(
++                    clean_extr,
++                    c0_count,
++                    name="clean_extrinsic",
++                    selection="tail",
++                )
++            )
++            register_intrinsics = (
++                context_intrinsics
++                if context_intrinsics is not None
++                else _camera_array_for_frame_count(
++                    clean_intr,
++                    c0_count,
++                    name="clean_intrinsic",
++                    selection="tail",
++                )
++            )
++            context_prefix_chunks = []
+             try:
+-                handler.register_source_sequence(
+-                    device,
+-                    c0_frames,
+-                    extrinsics=_camera_array_for_frame_count(
+-                        clean_extr,
+-                        c0_count,
+-                        name="clean_extrinsic",
+-                        selection="tail",
+-                    ),
+-                    intrinsics=_camera_array_for_frame_count(
+-                        clean_intr,
+-                        c0_count,
+-                        name="clean_intrinsic",
+-                        selection="tail",
+-                    ),
+-                    depths=c0_register_depths,
+-                    start_index=0,
+-                    force_using_input_extrinics=True,
++                registration_batch_frames = (
++                    int(cs) * 4
++                    if context_as_generated_history and context_frames is not None
++                    else int(register_frames.shape[0])
+                 )
++                for batch_start in range(
++                    0, int(register_frames.shape[0]), registration_batch_frames
++                ):
++                    batch_end = min(
++                        batch_start + registration_batch_frames,
++                        int(register_frames.shape[0]),
++                    )
++                    batch_frames = register_frames[batch_start:batch_end]
++                    _register_source_sequence_batched(
++                        handler,
++                        device,
++                        batch_frames,
++                        extrinsics=np.asarray(register_extrinsics)[
++                            batch_start:batch_end
++                        ],
++                        intrinsics=np.asarray(register_intrinsics)[
++                            batch_start:batch_end
++                        ],
++                        depths=(
++                            None
++                            if context_frames is not None
++                            else c0_register_depths[batch_start:batch_end]
++                            if c0_register_depths is not None
++                            else None
++                        ),
++                        start_index=batch_start,
++                        force_using_input_extrinics=True,
++                    )
++                    if context_as_generated_history and context_frames is not None:
++                        context_prefix_chunks.append(
++                            _encode_frames_per_frame(
++                                pipe,
++                                batch_frames,
++                                device,
++                                tiled=vae_decode_tiled,
++                            )
++                        )
+             except Exception as exc:
+                 if not _is_da3_insufficient_non_sky_error(exc):
+                     raise
+@@ -804,14 +1402,71 @@ def _run_causal_kv_rollout(
+                 pending_generated_memory.clear()
+                 _release_cached_memory()
+             else:
+-                mosaic_query_latents = _encode_frames_per_frame(
+-                    pipe, c0_frames, device, tiled=vae_decode_tiled
++                if context_prefix_chunks:
++                    mosaic_query_latents = torch.cat(
++                        context_prefix_chunks, dim=2
++                    )
++                else:
++                    mosaic_query_latents = _encode_frames_per_frame(
++                        pipe, register_frames, device, tiled=vae_decode_tiled
++                    )
++                appearance_anchor_stats = _generated_chunk_appearance_stats(
++                    register_frames[-c0_count:]
+                 )
+-                mosaic_source_timeline_positions = [
+-                    0
++                appearance_trusted_stats = dict(appearance_anchor_stats)
++                mosaic_source_appearance_quality = [
++                    1.0
+                 ] * int(mosaic_query_latents.shape[2])
++                if memory_diagnostics is not None:
++                    _record_validation_candidate_frames(
++                        memory_diagnostics["candidate_frames_by_id"],
++                        register_frames,
++                        start_index=0,
++                        max_width=320,
++                    )
++                mosaic_source_timeline_positions = list(
++                    range(int(mosaic_query_latents.shape[2]))
++                )
++                if context_as_generated_history and context_frames is not None:
++                    # Context occupies the prefix of the synthetic generated
++                    # timeline; subsequent model-generated chunks follow it.
++                    mosaic_source_timeline_offset = int(
++                        mosaic_query_latents.shape[2]
++                    )
+                 memory_registration_stats["c0_registered"] = True
+-                memory_registration_stats["published_rgb_count"] = int(c0_count)
++                memory_registration_stats["published_rgb_count"] = int(
++                    register_frames.shape[0]
++                )
++                if context_frames is not None:
++                    full_context_memory_stats.update(
++                        {
++                            "registered": True,
++                            "frame_count": int(context_frames.shape[0]),
++                            "mosaic_latent_count": int(mosaic_query_latents.shape[2]),
++                            "registration_mode": (
++                                "context_as_generated_history"
++                                if context_as_generated_history
++                                else "full_context_batch"
++                            ),
++                        }
++                    )
++                    if context_as_generated_history:
++                        context_prefix_chunks = list(
++                            range(
++                                int(
++                                    math.ceil(
++                                        int(context_frames.shape[0])
++                                        / max(1, int(cs) * 4)
++                                    )
++                                )
++                            )
++                        )
++                        full_context_memory_stats[
++                            "context_prefix_published_chunks"
++                        ] = context_prefix_chunks
++                        memory_registration_stats[
++                            "context_prefix_published_chunks"
++                        ] = context_prefix_chunks
+             if validation_c0_only_memory:
+                 print(
+                     "[causal-kv] validation C0-only memory: registered only "
+@@ -829,6 +1484,7 @@ def _run_causal_kv_rollout(
+ 
+     def _publish_pending_generated_memory(force=False):
+         nonlocal mosaic_query_latents, published_rgb_count
++        nonlocal generated_published_rgb_count
+         nonlocal mosaic_source_timeline_positions
+         if memory_disabled_after_c0_failure:
+             pending_generated_memory.clear()
+@@ -839,13 +1495,20 @@ def _run_causal_kv_rollout(
+             return
+         published_chunks = []
+         for item in pending_generated_memory:
++            register_start_index = (
++                0
++                if mosaic_query_latents is None
++                else int(mosaic_query_latents.shape[2])
++            )
+             try:
+-                handler.register_source_sequence(
++                _register_source_sequence_batched(
++                    handler,
+                     device,
+                     item["frames"],
+                     extrinsics=item["extrinsics"],
+                     intrinsics=item["intrinsics"],
+                     depths=item.get("depths"),
++                    start_index=register_start_index,
+                     force_using_input_extrinics=True,
+                 )
+             except Exception as exc:
+@@ -863,12 +1526,33 @@ def _run_causal_kv_rollout(
+                 )
+                 _release_cached_memory()
+                 continue
++            if memory_diagnostics is not None:
++                _record_validation_candidate_frames(
++                    memory_diagnostics["candidate_frames_by_id"],
++                    item["frames"],
++                    start_index=register_start_index,
++                    max_width=320,
++                )
+             if mosaic_query_latents is None:
+                 mosaic_query_latents = item["latents"]
+             else:
+                 mosaic_query_latents = torch.cat(
+                     [mosaic_query_latents, item["latents"]], dim=2
+                 )
++            item_quality = float(
++                np.clip(float(item.get("appearance_quality", 1.0)), 0.0, 1.0)
++            )
++            mosaic_source_appearance_quality.extend(
++                [item_quality] * int(item["latents"].shape[2])
++            )
++            if len(mosaic_source_appearance_quality) != int(
++                mosaic_query_latents.shape[2]
++            ):
++                raise RuntimeError(
++                    "validation memory quality length mismatch: "
++                    f"quality={len(mosaic_source_appearance_quality)}, "
++                    f"latents={int(mosaic_query_latents.shape[2])}."
++                )
+             source_positions = [
+                 int(value) for value in item.get("source_timeline_positions", [])
+             ]
+@@ -899,8 +1583,12 @@ def _run_causal_kv_rollout(
+                 published_rgb_count = max(
+                     int(published_rgb_count), int(item["rgb_end"])
+                 )
++                generated_published_rgb_count = max(
++                    int(generated_published_rgb_count), int(item["rgb_end"])
++                )
+             else:
+                 published_rgb_count += int(item["frames"].shape[0])
++                generated_published_rgb_count += int(item["frames"].shape[0])
+             memory_registration_stats["published_rgb_count"] = int(published_rgb_count)
+         pending_generated_memory.clear()
+         if memory_publish_interval > 1:
+@@ -914,6 +1602,7 @@ def _run_causal_kv_rollout(
+     nblocks = len(dit.blocks)
+     rolling_cache = init_causal_kv_caches(nblocks)
+     rolling_latents = None
++    generation_decode_anchor = initial_c0.detach().clone()
+     if not t2v_no_ref:
+         initial_anchor_position = _anchor_position_for_context_start(0)
+         initial_anchor_camera_frame = _anchor_camera_for_context_start(0)
+@@ -930,6 +1619,268 @@ def _run_causal_kv_rollout(
+                 write_cache=True,
+                 cur_cache_chunk_ids=[-1],
+             )
++        rolling_latents = initial_c0.detach().clone()
++    if teacher_context is not None:
++        teacher_latents = teacher_context["latents"].to(device=device, dtype=dtype)
++        teacher_extr = np.asarray(
++            teacher_context["target_extrinsics"], dtype=np.float32
++        )
++        teacher_intr = np.asarray(
++            teacher_context["target_intrinsics"], dtype=np.float32
++        )
++        teacher_query_kwargs = _generated_memory_query_kwargs_from_args(args)
++        full_teacher_memory_K = _registered_memory_K_for_query(
++            handler,
++            mosaic_query_latents[0],
++            context="[causal-kv][teacher-forcing]",
++        )
++        for teacher_chunk_idx in range(int(teacher_context["chunk_count"])):
++            latent_start = teacher_chunk_idx * cs
++            latent_end = latent_start + cs
++            rgb_start = teacher_chunk_idx * cs * 4
++            rgb_end = rgb_start + cs * 4
++            current_teacher_latents = teacher_latents[
++                :, :, latent_start:latent_end
++            ].contiguous()
++            current_positions = [
++                2 + latent_start + local_idx for local_idx in range(cs)
++            ]
++            current_camera_frames = [
++                1 + latent_start + local_idx for local_idx in range(cs)
++            ]
++
++            # The handler may already contain the complete Context for cheap
++            # DA3 registration, but each teacher chunk can retrieve only the
++            # causally visible RGB prefix, matching native write-back timing.
++            eligible_rgb_count = min(
++                1 + rgb_start, int(mosaic_query_latents.shape[2])
++            )
++            # Native rollout builds each Mosaic query from the previous clean
++            # camera followed by the current 12 RGB poses, then aligns that
++            # trajectory against the previous clean camera and drops the
++            # anchor.  Reproduce that contract here even though the complete
++            # GT Context is resident in the handler: otherwise
++            # ``handler.last_extrinsic`` would point at the *final* Context
++            # frame and a direct ``teacher_extr[...]`` query would use a
++            # different coordinate frame from native chunk replay.
++            teacher_anchor_extr = np.asarray(
++                register_extrinsics[rgb_start : rgb_start + 1],
++                dtype=np.float32,
++            )
++            teacher_query_raw = np.concatenate(
++                [teacher_anchor_extr, teacher_extr[rgb_start:rgb_end]],
++                axis=0,
++            )
++            teacher_query_extrinsics = handler.align_w2c_trajectory(
++                teacher_query_raw,
++                B_w2c=teacher_anchor_extr,
++            )[1:]
++            teacher_mosaic = handler.query_hits_mode_new(
++                device,
++                teacher_query_extrinsics,
++                mosaic_query_latents[0, :, :eligible_rgb_count].contiguous(),
++                w2c=np.asarray(handler.extrinsics, dtype=np.float32)[
++                    :eligible_rgb_count
++                ],
++                depths=np.asarray(handler.depths)[:eligible_rgb_count],
++                **teacher_query_kwargs,
++                memory_K=full_teacher_memory_K[:eligible_rgb_count],
++                query_K=teacher_intr[rgb_start:rgb_end],
++            )
++            if isinstance(teacher_mosaic, (tuple, list)):
++                teacher_mosaic = teacher_mosaic[0]
++            teacher_mosaic = teacher_mosaic.unsqueeze(0).to(
++                device=device, dtype=dtype
++            )
++            if int(teacher_mosaic.shape[2]) != cs:
++                raise RuntimeError(
++                    "teacher-forced Mosaic query returned the wrong latent "
++                    f"count: {int(teacher_mosaic.shape[2])} vs {cs}"
++                )
++
++            selected_teacher_context = []
++            if dynamic_context_pool is not None:
++                rolling_positions = list(
++                    rolling_cache[0].get(
++                        "positions", rolling_cache[0].get("frames", [])
++                    )
++                )
++                rolling_frames = list(rolling_cache[0].get("frames", []))
++                selected_teacher_context = dynamic_context_pool.select_for_chunk(
++                    teacher_chunk_idx,
++                    teacher_extr[rgb_start:rgb_end],
++                    exclude_positions=set(rolling_positions),
++                    exclude_camera_frames=set(rolling_frames),
++                    max_source_position_exclusive=min(current_positions),
++                )
++            teacher_context_cache = None
++            if selected_teacher_context:
++                selected_latents = torch.cat(
++                    [
++                        entry["latent"].to(device=device, dtype=dtype)
++                        for entry in selected_teacher_context
++                    ],
++                    dim=2,
++                ).contiguous()
++                teacher_context_cache = init_causal_kv_caches(nblocks)
++                model_fn_causal_kv(
++                    dit,
++                    latents_chunk=selected_latents,
++                    timestep_frames=torch.zeros(
++                        int(selected_latents.shape[2]), device=device, dtype=dtype
++                    ),
++                    context=context,
++                    camera_info=camera_info,
++                    cur_positions=[
++                        int(entry["position"])
++                        for entry in selected_teacher_context
++                    ],
++                    cur_frames=[
++                        int(entry["camera_frame"])
++                        for entry in selected_teacher_context
++                    ],
++                    caches=teacher_context_cache,
++                    write_cache=True,
++                    cur_cache_chunk_ids=[teacher_chunk_idx]
++                    * len(selected_teacher_context),
++                )
++            teacher_read_cache = _causal_kv_concat_caches(
++                teacher_context_cache, rolling_cache
++            )
++            teacher_cache_positions = list(
++                teacher_read_cache[0].get(
++                    "positions", teacher_read_cache[0].get("frames", [])
++                )
++            )
++            teacher_cache_frames = list(
++                teacher_read_cache[0].get("frames", [])
++            )
++            with _maybe_gather_zero3_module(accelerator, dit, label="dit"):
++                model_fn_causal_kv(
++                    dit,
++                    latents_chunk=current_teacher_latents,
++                    timestep_frames=torch.zeros(
++                        2 * cs, device=device, dtype=dtype
++                    ),
++                    context=context,
++                    camera_info=camera_info,
++                    cur_positions=current_positions,
++                    cur_frames=current_camera_frames,
++                    caches=teacher_read_cache,
++                    mosaic_latent=teacher_mosaic,
++                    mosaic_positions=current_positions,
++                    mosaic_frames=current_camera_frames,
++                    cache_positions=teacher_cache_positions,
++                    cache_frames=teacher_cache_frames,
++                    cache_read_chunk_id=teacher_chunk_idx,
++                    write_cache=True,
++                )
++            current_teacher_cache = _causal_kv_tail_cache_frames(
++                teacher_read_cache,
++                cs,
++                context=(
++                    "[causal-kv][teacher-forcing] extract Context chunk "
++                    f"{teacher_chunk_idx}"
++                ),
++            )
++            rolling_cache = _causal_kv_concat_caches(
++                rolling_cache, current_teacher_cache
++            )
++            rolling_cache = _causal_kv_trim_rolling_window(
++                rolling_cache,
++                frames_per_chunk=cs,
++                window_chunks=ccc,
++                fixed_initial_anchor=fixed_initial_anchor,
++            )
++            rolling_latents = torch.cat(
++                [rolling_latents, current_teacher_latents.detach()], dim=2
++            ).contiguous()
++            rolling_latents = _causal_kv_trim_rolling_latents(
++                rolling_latents,
++                frames_per_chunk=cs,
++                window_chunks=ccc,
++                fixed_initial_anchor=fixed_initial_anchor,
++            )
++            if int(rolling_latents.shape[2]) != _causal_kv_frame_count(
++                rolling_cache
++            ):
++                raise RuntimeError(
++                    "teacher-forced rolling latent/cache provenance diverged: "
++                    f"latents={int(rolling_latents.shape[2])}, "
++                    f"cache={_causal_kv_frame_count(rolling_cache)}"
++                )
++
++            if dynamic_context_pool is not None:
++                teacher_entries = []
++                for local_idx in range(cs):
++                    block_start = rgb_start + local_idx * 4
++                    block_end = block_start + 4
++                    teacher_entries.append(
++                        {
++                            "source": "gt_context_teacher",
++                            "source_kind": "gt_context_teacher",
++                            "chunk_idx": int(teacher_chunk_idx),
++                            "latent": current_teacher_latents[
++                                :, :, local_idx : local_idx + 1
++                            ].detach().to(device="cpu", dtype=torch.float32),
++                            "position": int(current_positions[local_idx]),
++                            "source_timeline_position": int(
++                                1 + latent_start + local_idx
++                            ),
++                            "camera_frame": int(current_camera_frames[local_idx]),
++                            "rep_extrinsic": teacher_extr[
++                                block_start + min(1, block_end - block_start - 1)
++                            ],
++                            "extrinsic_block": teacher_extr[
++                                block_start:block_end
++                            ],
++                            "intrinsic_block": teacher_intr[
++                                block_start:block_end
++                            ],
++                            "appearance_quality": 1.0,
++                        }
++                    )
++                dynamic_context_pool.generated_entries.extend(teacher_entries)
++                dynamic_context_pool.last_rgb_frame = np.ascontiguousarray(
++                    teacher_context["target_frames"][rgb_end - 1]
++                )
++            validation_rope_stats["teacher_context_cache_fill_chunks"].append(
++                {
++                    "chunk_idx": int(teacher_chunk_idx),
++                    "latent_positions": [int(value) for value in current_positions],
++                    "camera_frames": [int(value) for value in current_camera_frames],
++                    "eligible_mosaic_rgb_count": int(eligible_rgb_count),
++                    "rolling_kv_frame_count": int(
++                        _causal_kv_frame_count(rolling_cache)
++                    ),
++                    "dynamic_context_source": [
++                        str(entry.get("source") or "unknown")
++                        for entry in selected_teacher_context
++                    ],
++                }
++            )
++            # Only rolling_cache is persistent across chunks.  The read cache
++            # has been extended in-place by cache fill and is therefore larger
++            # than the trimmed rolling window; retaining it would duplicate
++            # several full-resolution KV tensors during the next chunk.
++            teacher_context_cache = None
++            teacher_read_cache = None
++            current_teacher_cache = None
++            teacher_mosaic = None
++            selected_teacher_context = None
++            selected_latents = None
++            current_teacher_latents = None
++            _release_cached_memory()
++        generation_decode_anchor = teacher_latents[:, :, -1:].detach().clone()
++        teacher_latents = None
++        _release_cached_memory()
++        print(
++            "[causal-kv][teacher-forcing] committed GT Context causal state: "
++            f"chunks={teacher_context['chunk_count']}, "
++            f"rolling_kv={_causal_kv_frame_count(rolling_cache)}, "
++            "mosaic=causal-prefix, dynamic_context=updated",
++            flush=True,
++        )
+     scheduler = pipe.scheduler
+     timesteps, sigmas = prepare_causal_dmd_eval_scheduler(
+         scheduler,
+@@ -941,6 +1892,11 @@ def _run_causal_kv_rollout(
+     scheduler.timesteps = timesteps.detach().to(device="cpu", dtype=torch.float32)
+     scheduler.sigmas = sigmas.detach().to(device="cpu", dtype=torch.float32)
+     scheduler.training = False
++    if same_pose_refresh_anchor_only_steps > len(scheduler.timesteps):
++        raise ValueError(
++            "causal_same_pose_refresh_anchor_only_steps cannot exceed the "
++            f"denoising step count {len(scheduler.timesteps)}"
++        )
+     print(
+         f"[inference][causal_dmd] effective {len(timesteps)}-step contract "
+         f"model_dtype={dtype} "
+@@ -1057,8 +2013,21 @@ def _run_causal_kv_rollout(
+             "causal_validation_prefix_noise_scales_by_step requires "
+             "causal_validation_prefix_noise_mode=hiar_sde."
+         )
+-    if prefix_noise_mode == "hiar_sde":
+-        rolling_latents = initial_c0.detach().clone()
++    if prefix_noise_mode == "hiar_sde" and rolling_latents is None:
++        rolling_latents = generation_decode_anchor.detach().clone()
++    if same_pose_refresh_interval:
++        if prefix_noise_mode != "none":
++            raise ValueError(
++                "same-pose refresh cannot be combined with HiAR prefix noise; "
++                "test one refresh mechanism at a time"
++            )
++        print(
++            "[causal-kv][same-pose-refresh] enabled: interval_chunks="
++            f"{same_pose_refresh_interval}; anchor_only_steps="
++            f"{same_pose_refresh_anchor_only_steps}; reset_rolling="
++            f"{same_pose_refresh_reset_rolling}.",
++            flush=True,
++        )
+     mosaic_guidance_scale_raw = getattr(
+         args, "causal_validation_mosaic_guidance_scale", 1.0
+     )
+@@ -1305,6 +2274,92 @@ def _run_causal_kv_rollout(
+ 
+     all_clean, all_mosaic = [], []
+     for i in range(total_chunks):
++        if interactive_camera:
++            rgb_start = int(i) * cs * 4
++            rgb_end = rgb_start + cs * 4
++            camera_update = yield {
++                "event": "camera_request",
++                "chunk_idx": int(i),
++                "rgb_frame_count": int(cs * 4),
++                "default_intrinsics": full_noisy_intr[rgb_start:rgb_end]
++                .detach()
++                .float()
++                .cpu()
++                .numpy(),
++                "default_extrinsics": full_noisy_extr[rgb_start:rgb_end]
++                .detach()
++                .float()
++                .cpu()
++                .numpy(),
++            }
++            if not isinstance(camera_update, dict):
++                raise TypeError("interactive camera update must be a mapping")
++            update_intr = torch.as_tensor(
++                camera_update.get("intrinsics"),
++                device=full_noisy_intr.device,
++                dtype=full_noisy_intr.dtype,
++            )
++            update_extr = torch.as_tensor(
++                camera_update.get("extrinsics"),
++                device=full_noisy_extr.device,
++                dtype=full_noisy_extr.dtype,
++            )
++            expected_intr_shape = tuple(full_noisy_intr[rgb_start:rgb_end].shape)
++            expected_extr_shape = tuple(full_noisy_extr[rgb_start:rgb_end].shape)
++            if tuple(update_intr.shape) != expected_intr_shape:
++                raise ValueError(
++                    "interactive camera intrinsic shape mismatch: "
++                    f"expected={expected_intr_shape}, observed={tuple(update_intr.shape)}."
++                )
++            if tuple(update_extr.shape) != expected_extr_shape:
++                raise ValueError(
++                    "interactive camera extrinsic shape mismatch: "
++                    f"expected={expected_extr_shape}, observed={tuple(update_extr.shape)}."
++                )
++            full_noisy_intr[rgb_start:rgb_end] = update_intr
++            full_noisy_extr[rgb_start:rgb_end] = update_extr
++            camera_noisy_intr = full_noisy_intr
++            camera_noisy_extr = full_noisy_extr
++            if teacher_context is not None:
++                camera_noisy_intr = torch.cat(
++                    [
++                        torch.as_tensor(
++                            teacher_context["target_intrinsics"],
++                            device=full_noisy_intr.device,
++                            dtype=full_noisy_intr.dtype,
++                        ),
++                        full_noisy_intr,
++                    ],
++                    dim=0,
++                )
++                camera_noisy_extr = torch.cat(
++                    [
++                        torch.as_tensor(
++                            teacher_context["target_extrinsics"],
++                            device=full_noisy_extr.device,
++                            dtype=full_noisy_extr.dtype,
++                        ),
++                        full_noisy_extr,
++                    ],
++                    dim=0,
++                )
++            camera_info = WAN_VIDEO_PROPE_CAMERA_UNIT.process(
++                pipe=None,
++                use_prope=True,
++                h=h,
++                w=w,
++                dtype=dtype,
++                device=device,
++                first_frame_count=0 if t2v_no_ref else initial_context_count + 1,
++                mosaic_frame_count=0,
++                clean_latent_indices_prope_intrinsic=camera_clean_intr,
++                clean_latent_indices_prope_extrinsic=camera_clean_extr,
++                noisy_latent_indices_prope_intrinsic=camera_noisy_intr,
++                noisy_latent_indices_prope_extrinsic=camera_noisy_extr,
++                trans_scale=getattr(dit, "trans_scale", 50.0),
++            )["camera_info"]
++            cam["noisy_latent_indices_prope_extrinsic"] = full_noisy_extr
++        diagnostic_candidate_groups = [[] for _ in range(cs)]
+         section_idx = min(
+             int(i) // max(1, latent_window_size // cs),
+             len(section_contexts) - 1,
+@@ -1358,6 +2413,9 @@ def _run_causal_kv_rollout(
+         mosaic_context_candidate_frame_ids = []
+         mosaic_context_candidate_age_frames = []
+         mosaic_context_active_i = False
++        query_extrinsics_count = 0
++        query_anchor_mode = None
++        query_window_rgb_start = None
+         mfc = 0
+         eligible_memory_source_count = None
+         if (
+@@ -1392,14 +2450,35 @@ def _run_causal_kv_rollout(
+             # handler.last_extrinsic is the latest generated frame, not C0. Use
+             # that same frame as the clean anchor so chunk-level k=1 rollout and
+             # section-level validation query in the same coordinate frame.
+-            if int(published_rgb_count) <= 0:
+-                query_anchor_extr = clean_extr[-1:]
++            query_published_rgb_count = (
++                generated_published_rgb_count
++                if context_as_generated_history and context_frames is not None
++                else published_rgb_count
++            )
++            if int(query_published_rgb_count) <= 0:
++                # In Context-as-generated-history mode, generated query poses
++                # begin at the last Context camera, not at C0.
++                query_anchor_mode = (
++                    "context_last_frame"
++                    if context_as_generated_history and context_frames is not None
++                    else "clean_anchor"
++                )
++                query_anchor_extr = (
++                    torch.as_tensor(
++                        register_extrinsics[-1:],
++                        device=full_noisy_extr.device,
++                        dtype=full_noisy_extr.dtype,
++                    )
++                    if context_as_generated_history and context_frames is not None
++                    else clean_extr[-1:]
++                )
+                 query_window_rgb_start = 0
+             else:
++                query_anchor_mode = "generated_last_frame"
+                 query_anchor_extr = full_noisy_extr[
+-                    published_rgb_count - 1 : published_rgb_count
++                    query_published_rgb_count - 1 : query_published_rgb_count
+                 ]
+-                query_window_rgb_start = int(published_rgb_count)
++                query_window_rgb_start = int(query_published_rgb_count)
+             q_extr = torch.cat(
+                 [
+                     query_anchor_extr.repeat(4, 1, 1),
+@@ -1413,6 +2492,7 @@ def _run_causal_kv_rollout(
+             local_start = rgb_start - query_window_rgb_start
+             local_end = rgb_end - query_window_rgb_start
+             query_extrinsics = q_extr_np[local_start:local_end]
++            query_extrinsics_count = int(len(query_extrinsics))
+             full_source_latents = mosaic_query_latents[0].clone()
+             full_memory_K = _registered_memory_K_for_query(
+                 handler,
+@@ -1423,6 +2503,22 @@ def _run_causal_kv_rollout(
+                 :, : int(eligible_memory_source_count)
+             ].contiguous()
+             memory_K_arg = full_memory_K[: int(eligible_memory_source_count)]
++            memory_quality_arg = None
++            if quality_weighted_retrieval:
++                if len(mosaic_source_appearance_quality) != int(
++                    full_source_latents.shape[1]
++                ):
++                    raise RuntimeError(
++                        "causal memory quality/source length mismatch before query: "
++                        f"quality={len(mosaic_source_appearance_quality)}, "
++                        f"source={int(full_source_latents.shape[1])}."
++                    )
++                memory_quality_arg = np.asarray(
++                    mosaic_source_appearance_quality[
++                        : int(eligible_memory_source_count)
++                    ],
++                    dtype=np.float32,
++                )
+             memory_w2c_arg = None
+             memory_depths_arg = None
+             if memory_context_selection_policy == "nonlocal_oldest":
+@@ -1434,6 +2530,9 @@ def _run_causal_kv_rollout(
+                 ]
+             query_K_arg = full_noisy_intr[rgb_start:rgb_end].detach().float().cpu().numpy()
+             generated_query_kwargs = _generated_memory_query_kwargs_from_args(args)
++            return_candidate_frame_ids = bool(
++                mosaic_context_topk or memory_diagnostics is not None
++            )
+             queried_result = handler.query_hits_mode_new(
+                 device,
+                 query_extrinsics,
+@@ -1443,10 +2542,24 @@ def _run_causal_kv_rollout(
+                 **generated_query_kwargs,
+                 memory_K=memory_K_arg,
+                 query_K=query_K_arg,
+-                return_candidate_frame_ids=bool(mosaic_context_topk),
++                memory_quality=memory_quality_arg,
++                memory_quality_floor=quality_retrieval_floor,
++                return_candidate_frame_ids=return_candidate_frame_ids,
+             )
+-            if mosaic_context_topk:
++            if return_candidate_frame_ids:
+                 queried, candidate_frame_ids, _ = queried_result
++                diagnostic_candidate_groups = [
++                    [int(frame_id) for frame_id in frame_ids if int(frame_id) >= 0]
++                    for frame_ids in candidate_frame_ids
++                ]
++                if len(diagnostic_candidate_groups) < cs:
++                    diagnostic_candidate_groups.extend(
++                        [[] for _ in range(cs - len(diagnostic_candidate_groups))]
++                    )
++                diagnostic_candidate_groups = diagnostic_candidate_groups[:cs]
++            else:
++                queried = queried_result
++            if mosaic_context_topk:
+                 context_candidate_frame_ids = [
+                     list(frame_ids)[:mosaic_context_topk]
+                     for frame_ids in candidate_frame_ids
+@@ -1521,7 +2634,6 @@ def _run_causal_kv_rollout(
+                         device=device, dtype=dtype
+                     )
+             else:
+-                queried = queried_result
+                 mosaic_context_active_i = bool(mosaic_context_frames)
+             if isinstance(queried, (tuple, list)):
+                 queried = queried[0]
+@@ -1584,11 +2696,60 @@ def _run_causal_kv_rollout(
+                 "mosaic_context_candidate_age_frames": list(
+                     mosaic_context_candidate_age_frames
+                 ),
++                "query_extrinsics_count": int(query_extrinsics_count),
++                "query_anchor_mode": query_anchor_mode,
++                "query_window_rgb_start": query_window_rgb_start,
+                 "mosaic_context_topk_valid_ratio": (
+                     mosaic_context_topk_valid_ratio
+                 ),
+             }
+         )
++        if memory_diagnostics is not None:
++            memory_diagnostics["candidate_groups"].extend(
++                [list(group) for group in diagnostic_candidate_groups]
++            )
++            newest_frame_id = int(eligible_memory_source_count or 0) - 1
++            valid_ratios = [0.0] * cs
++            if m_i is not None:
++                valid = m_i.detach().abs().amax(dim=1)[0] > 1e-6
++                valid_ratios = [
++                    float(valid[latent_idx].float().mean().item())
++                    for latent_idx in range(min(cs, int(valid.shape[0])))
++                ]
++                valid_ratios.extend([0.0] * (cs - len(valid_ratios)))
++            for latent_idx, group in enumerate(diagnostic_candidate_groups):
++                memory_diagnostics["latent_groups"].append(
++                    {
++                        "latent_index": int(i * cs + latent_idx),
++                        "chunk_index": int(i),
++                        "chunk_latent_offset": int(latent_idx),
++                        "output_frame_start": int(1 + 4 * (i * cs + latent_idx)),
++                        "output_frame_end": int(4 + 4 * (i * cs + latent_idx)),
++                        "eligible_memory_count": int(
++                            eligible_memory_source_count or 0
++                        ),
++                        "candidate_frame_ids": [int(frame_id) for frame_id in group],
++                        "candidate_appearance_quality": [
++                            float(mosaic_source_appearance_quality[int(frame_id)])
++                            for frame_id in group
++                            if 0 <= int(frame_id) < len(mosaic_source_appearance_quality)
++                        ],
++                        "candidate_age_frames": [
++                            int(newest_frame_id - int(frame_id)) for frame_id in group
++                        ],
++                        "mosaic_latent_valid_ratio": float(valid_ratios[latent_idx]),
++                        "rolling_kv_latent_count": int(
++                            _causal_kv_frame_count(rolling_cache)
++                        ),
++                        "dynamic_context_sources": [
++                            str(entry.get("source") or "unknown")
++                            for entry in selected_context_entries
++                        ],
++                        "dynamic_context_positions": [
++                            int(entry["position"]) for entry in selected_context_entries
++                        ],
++                    }
++                )
+ 
+         with _maybe_gather_zero3_module(accelerator, dit, label="dit"):
+             context_cache = None
+@@ -1901,16 +3062,45 @@ def _run_causal_kv_rollout(
+             ).to(device=device, dtype=dtype)
+             from tqdm import tqdm as _tqdm
+ 
+-            def _kv_pred(latents_in, tval, *, step_index=None):
++            refresh_due = _same_pose_refresh_due(i, same_pose_refresh_interval)
++            refresh_anchor_cache_bundle = None
++            if refresh_due:
++                refresh_anchor_cache = _causal_kv_slice_cache_frames(
++                    rolling_cache,
++                    [0],
++                    context=f"[same-pose-refresh] anchor cache chunk={i}",
++                )
++                refresh_anchor_cache_bundle = (
++                    refresh_anchor_cache,
++                    list(
++                        refresh_anchor_cache[0].get(
++                            "positions",
++                            refresh_anchor_cache[0].get("frames", []),
++                        )
++                    ),
++                    list(refresh_anchor_cache[0].get("frames", [])),
++                )
++
++            def _kv_pred(
++                latents_in,
++                tval,
++                *,
++                step_index=None,
++                cache_override=None,
++                force_no_mosaic=False,
++            ):
+                 tval = float(tval)
+                 use_mosaic_context_step = bool(
+-                    mosaic_context_cache is not None
++                    cache_override is None
++                    and mosaic_context_cache is not None
+                     and mosaic_context_step_mask[int(step_index)]
+                 )
+ 
+                 def _prediction_cache(with_mosaic_context):
+                     nonlocal hiar_prediction_cache_step_index
+                     nonlocal hiar_prediction_cache_step
++                    if cache_override is not None:
++                        return cache_override
+                     if prefix_noise_mode == "hiar_sde":
+                         if step_index is None:
+                             raise RuntimeError(
+@@ -1957,9 +3147,9 @@ def _run_causal_kv_rollout(
+                     if mosaic_repeat_by_step is not None
+                     else 1
+                 )
+-                mosaic_latent_step = m_i
+-                mosaic_positions_step = m_pos
+-                mosaic_frames_step = m_fr
++                mosaic_latent_step = None if force_no_mosaic else m_i
++                mosaic_positions_step = None if force_no_mosaic else m_pos
++                mosaic_frames_step = None if force_no_mosaic else m_fr
+                 if mosaic_latent_step is not None and mosaic_repeat > 1:
+                     mosaic_latent_step = mosaic_latent_step.repeat(
+                         1, 1, mosaic_repeat, 1, 1
+@@ -2060,7 +3250,7 @@ def _run_causal_kv_rollout(
+                     mosaic_positions_step,
+                     mosaic_frames_step,
+                 )
+-                if mosaic_guidance_scale != 1.0 and m_i is not None:
++                if mosaic_guidance_scale != 1.0 and mosaic_latent_step is not None:
+                     pred_without_mosaic = _predict_with_context_guidance(
+                         None, None, None
+                     )
+@@ -2117,6 +3307,90 @@ def _run_causal_kv_rollout(
+                         cur,
+                     )
+             latents = cur
++            if refresh_due:
++                pre_refresh_latents = latents.detach().clone()
++                refresh_seed = (
++                    int(args.validation_seed)
++                    + int(batch_idx) * 1000
++                    + int(i)
++                    + 90000
++                )
++                refresh_noise_gen = torch.Generator().manual_seed(refresh_seed)
++                refresh_noise = torch.randn(
++                    latents.shape,
++                    generator=refresh_noise_gen,
++                ).to(device=device, dtype=dtype)
++                refresh_cur = scheduler.add_noise(
++                    latents,
++                    refresh_noise,
++                    steps[0],
++                )
++                refresh_renoise_gen = torch.Generator().manual_seed(
++                    refresh_seed + 10000
++                )
++                for j, t in enumerate(
++                    _tqdm(
++                        steps,
++                        desc=f"[same-pose-refresh] chunk {i + 1}/{total_chunks}",
++                        leave=False,
++                    )
++                ):
++                    anchor_only = j < same_pose_refresh_anchor_only_steps
++                    v = _kv_pred(
++                        refresh_cur,
++                        float(t),
++                        step_index=j,
++                        cache_override=(
++                            refresh_anchor_cache_bundle if anchor_only else None
++                        ),
++                        force_no_mosaic=anchor_only,
++                    )
++                    if j < len(steps) - 1:
++                        refresh_renoise = torch.randn(
++                            refresh_cur.shape,
++                            generator=refresh_renoise_gen,
++                        ).to(device=device, dtype=dtype)
++                        refresh_cur = _causal_dmd_validation_transition(
++                            scheduler,
++                            v,
++                            t,
++                            refresh_cur,
++                            next_timestep=steps[j + 1],
++                            renoise=refresh_renoise,
++                        )
++                    else:
++                        refresh_cur = _causal_dmd_validation_transition(
++                            scheduler,
++                            v,
++                            t,
++                            refresh_cur,
++                        )
++                latents = refresh_cur
++                refresh_stats = _same_pose_refresh_latent_stats(
++                    pre_refresh_latents,
++                    latents,
++                )
++                refresh_stats.update(
++                    {
++                        "chunk_idx": int(i),
++                        "chunk_number": int(i + 1),
++                        "positions": [int(value) for value in cur_positions],
++                        "camera_frames": [
++                            int(value) for value in cur_camera_frames
++                        ],
++                        "anchor_position": int(rolling_anchor_position),
++                        "anchor_camera_frame": int(rolling_anchor_camera_frame),
++                    }
++                )
++                validation_rope_stats["same_pose_refresh_chunks"].append(
++                    refresh_stats
++                )
++                print(
++                    "[causal-kv][same-pose-refresh] chunk="
++                    f"{i + 1} positions={cur_positions} relative_delta="
++                    f"{refresh_stats['relative_delta']:.4f}",
++                    flush=True,
++                )
+             # Cache-fill uses the final denoising step's context visibility. This
+             # prevents a high-noise-only diagnostic context from leaking into the
+             # clean prefix KV persisted for the next chunk.
+@@ -2162,23 +3436,35 @@ def _run_causal_kv_rollout(
+             cs,
+             context=f"[causal-kv] extract generated chunk cache chunk={i}",
+         )
+-        rolling_cache = _causal_kv_concat_caches(rolling_cache, current_chunk_cache)
+-        rolling_cache = _causal_kv_trim_rolling_window(
+-            rolling_cache,
+-            frames_per_chunk=cs,
+-            window_chunks=ccc,
+-            fixed_initial_anchor=fixed_initial_anchor,
+-        )
+-        if rolling_latents is not None:
+-            rolling_latents = torch.cat(
+-                [rolling_latents, latents.detach()], dim=2
+-            ).contiguous()
+-            rolling_latents = _causal_kv_trim_rolling_latents(
+-                rolling_latents,
++        if refresh_due and same_pose_refresh_reset_rolling:
++            rolling_cache = _causal_kv_tail_cache_frames(
++                current_chunk_cache,
++                1,
++                context=f"[same-pose-refresh] reanchor chunk={i}",
++            )
++        else:
++            rolling_cache = _causal_kv_concat_caches(
++                rolling_cache, current_chunk_cache
++            )
++            rolling_cache = _causal_kv_trim_rolling_window(
++                rolling_cache,
+                 frames_per_chunk=cs,
+                 window_chunks=ccc,
+                 fixed_initial_anchor=fixed_initial_anchor,
+             )
++        if rolling_latents is not None:
++            if refresh_due and same_pose_refresh_reset_rolling:
++                rolling_latents = latents.detach()[:, :, -1:].contiguous()
++            else:
++                rolling_latents = torch.cat(
++                    [rolling_latents, latents.detach()], dim=2
++                ).contiguous()
++                rolling_latents = _causal_kv_trim_rolling_latents(
++                    rolling_latents,
++                    frames_per_chunk=cs,
++                    window_chunks=ccc,
++                    fixed_initial_anchor=fixed_initial_anchor,
++                )
+             if int(rolling_latents.shape[2]) != _causal_kv_frame_count(
+                 rolling_cache
+             ):
+@@ -2188,6 +3474,25 @@ def _run_causal_kv_rollout(
+                     f"cache_frames={_causal_kv_frame_count(rolling_cache)}."
+                 )
+ 
++        # The rolling window above is the sole persistent KV owner.  Cache
++        # fill mutates its read cache by appending the current chunk, while the
++        # prediction closure also retains multiple concatenated views.  In a
++        # resident rollout those references otherwise survive the yield and
++        # overlap the next chunk's attention peak.
++        current_chunk_cache = None
++        cache_fill_read_cache = None
++        read_cache = None
++        read_cache_without_mosaic_context = None
++        context_cache = None
++        base_context_cache = None
++        mosaic_context_cache = None
++        prediction_cache_views = None
++        prediction_cache_views_without_mosaic_context = None
++        hiar_prediction_cache_step = None
++        refresh_anchor_cache_bundle = None
++        _kv_pred = None
++        _release_cached_memory()
++
+         has_future_query = int(i) + 1 < int(total_chunks)
+         dynamic_context_accepts_generated = (
+             _validation_dynamic_context_accepts_generated(validation_memory_mode)
+@@ -2227,7 +3532,9 @@ def _run_causal_kv_rollout(
+             and not memory_disabled_after_c0_failure
+         )
+         needs_generated_decode = bool(
+-            dynamic_context_needs_decode or generated_memory_has_consumer
++            dynamic_context_needs_decode
++            or generated_memory_has_consumer
++            or decode_output_chunks
+         )
+         generated_frames = None
+         if needs_generated_decode:
+@@ -2236,7 +3543,12 @@ def _run_causal_kv_rollout(
+                 decode_prefix_latents = current_chunk_cpu
+             elif i == 0:
+                 decode_prefix_latents = torch.cat(
+-                    [initial_c0.detach().to(device="cpu", dtype=latents.dtype), current_chunk_cpu],
++                    [
++                        generation_decode_anchor.detach().to(
++                            device="cpu", dtype=latents.dtype
++                        ),
++                        current_chunk_cpu,
++                    ],
+                     dim=2,
+                 )
+             else:
+@@ -2254,6 +3566,47 @@ def _run_causal_kv_rollout(
+             decode_prefix_latents = None
+             current_chunk_cpu = None
+ 
++        chunk_appearance_quality = 1.0
++        chunk_quality_record = None
++        if generated_frames is not None and (
++            quality_weighted_retrieval or quality_gated_context
++        ):
++            current_appearance_stats = _generated_chunk_appearance_stats(
++                generated_frames
++            )
++            if appearance_anchor_stats is None:
++                appearance_anchor_stats = dict(current_appearance_stats)
++            if appearance_trusted_stats is None:
++                appearance_trusted_stats = dict(appearance_anchor_stats)
++            mosaic_valid_ratio = 0.0
++            if m_i is not None:
++                mosaic_valid = m_i.detach().abs().amax(dim=1)[0] > 1e-6
++                mosaic_valid_ratio = float(mosaic_valid.float().mean().item())
++            quality_components = _generated_chunk_appearance_quality(
++                current_appearance_stats,
++                appearance_trusted_stats,
++                appearance_anchor_stats,
++                mosaic_valid_ratio=mosaic_valid_ratio,
++            )
++            chunk_appearance_quality = float(quality_components["quality"])
++            chunk_quality_record = {
++                "chunk_idx": int(i),
++                "appearance_quality": chunk_appearance_quality,
++                "stats": current_appearance_stats,
++                **quality_components,
++            }
++            memory_registration_stats["appearance_quality_chunks"].append(
++                chunk_quality_record
++            )
++            if chunk_appearance_quality >= max(
++                0.6, quality_context_threshold
++            ):
++                appearance_trusted_stats = _appearance_stats_ema(
++                    appearance_trusted_stats,
++                    current_appearance_stats,
++                    quality_trusted_ema,
++                )
++
+         gt_prefix_frames = None
+         gt_prefix_frame_indices = None
+         if dynamic_context_needs_gt_prefix or gt_memory_has_consumer:
+@@ -2295,6 +3648,12 @@ def _run_causal_kv_rollout(
+             context_publish_result = dynamic_context_pool.add_generated_chunk(
+                 pipe=pipe,
+                 generated_frames=context_register_frames,
++                generated_latents=(
++                    latents.detach()
++                    if dense_latent_dynamic_context
++                    and context_register_source == "generated"
++                    else None
++                ),
+                 chunk_idx=i,
+                 frames_per_chunk=cs,
+                 rgb_start=rgb_start,
+@@ -2303,7 +3662,24 @@ def _run_causal_kv_rollout(
+                 device=device,
+                 tiled=vae_decode_tiled,
+                 source=context_register_source,
++                appearance_quality=(
++                    chunk_appearance_quality
++                    if context_register_source == "generated"
++                    else 1.0
++                ),
++                minimum_quality=(
++                    quality_context_threshold
++                    if quality_gated_context
++                    and context_register_source == "generated"
++                    else 0.0
++                ),
+             )
++            if bool((context_publish_result or {}).get("used_dense_latents")):
++                memory_registration_stats["dense_context_chunks"].append(int(i))
++            if bool((context_publish_result or {}).get("quality_gated")):
++                memory_registration_stats["quality_gated_context_chunks"].append(
++                    int(i)
++                )
+             published_context_chunks = list(
+                 (context_publish_result or {}).get(
+                     "published_context_chunks", []
+@@ -2374,12 +3750,38 @@ def _run_causal_kv_rollout(
+                     f"[{rgb_start}:{rgb_end}] exceeds camera lengths "
+                     f"extr={int(full_noisy_extr.shape[0])} intr={int(full_noisy_intr.shape[0])}."
+                 )
+-            new_query_latents = _encode_frames_per_frame(
+-                pipe,
+-                register_frames,
+-                device,
+-                tiled=vae_decode_tiled,
++            use_dense_writeback = bool(
++                dense_latent_writeback
++                and register_source == "generated"
++                and register_rgb_source == "generated"
+             )
++            if use_dense_writeback:
++                new_query_latents, dense_reuse_stats = (
++                    _build_validation_neighbor_window_memory_latents(
++                        pipe,
++                        frames_np=register_frames,
++                        dense_latents=latents.detach(),
++                        extrinsics=full_noisy_extr[rgb_start:rgb_end]
++                        .detach()
++                        .float()
++                        .cpu()
++                        .numpy(),
++                        device=device,
++                        tiled=vae_decode_tiled,
++                        max_trans_m=dense_latent_max_trans_m,
++                        max_rot_deg=dense_latent_max_rot_deg,
++                    )
++                )
++                memory_registration_stats["dense_writeback_chunks"].append(
++                    {"chunk_idx": int(i), **dense_reuse_stats}
++                )
++            else:
++                new_query_latents = _encode_frames_per_frame(
++                    pipe,
++                    register_frames,
++                    device,
++                    tiled=vae_decode_tiled,
++                )
+             pending_generated_memory.append(
+                 {
+                     "chunk_idx": int(i),
+@@ -2389,8 +3791,13 @@ def _run_causal_kv_rollout(
+                     "intrinsics": full_noisy_intr[rgb_start:rgb_end].detach().float().cpu().numpy(),
+                     "depths": register_depths,
+                     "latents": new_query_latents,
++                    "appearance_quality": (
++                        chunk_appearance_quality
++                        if register_source == "generated"
++                        else 1.0
++                    ),
+                     "source_timeline_positions": [
+-                        1
++                        mosaic_source_timeline_offset
+                         + int(i) * cs
+                         + min(int(local_index) // 4, max(0, cs - 1))
+                         for local_index in range(int(new_query_latents.shape[2]))
+@@ -2400,6 +3807,92 @@ def _run_causal_kv_rollout(
+             )
+             _publish_pending_generated_memory()
+ 
++        if decode_output_chunks:
++            if generated_frames is None:
++                raise RuntimeError(
++                    "resident causal rollout requested decoded output but the "
++                    f"generated chunk {i} was not decoded."
++                )
++            # Native batch inference decodes the complete latent history once
++            # at the end. Decode the prefix accumulated so far before exposing
++            # a resident chunk, otherwise each step introduces a VAE seam.
++            output_frames = generated_frames
++            if not t2v_no_ref:
++                output_frames = _decode_native_resident_chunk(
++                    pipe,
++                    generation_decode_anchor,
++                    all_clean,
++                    chunk_idx=i,
++                    chunk_size=cs,
++                    device=device,
++                    tiled=vae_decode_tiled,
++                )
++            chunk_rope_stats = {}
++            if validation_rope_stats["chunks"]:
++                chunk_rope_stats = dict(validation_rope_stats["chunks"][-1])
++            yield {
++                "chunk_idx": int(i),
++                "total_chunks": int(total_chunks),
++                "is_last_chunk": int(i) + 1 == int(total_chunks),
++                "history_cursor_after": int((0 if t2v_no_ref else 1) + (i + 1) * cs),
++                "generated_frame_count": int(output_frames.shape[0]),
++                "frames": output_frames,
++                "latents": latents.detach().cpu(),
++                "mosaic_latents": all_mosaic[-1],
++                "memory_selection": {
++                    "memory_bank_read": bool(m_i is not None),
++                    "mosaic_latent_count": int(m_i.shape[2]) if m_i is not None else 0,
++                    "full_context_memory_registered": bool(
++                        full_context_memory
++                        and full_context_memory_stats["registered"]
++                    ),
++                    "full_context_memory_frame_count": int(
++                        full_context_memory_stats["frame_count"]
++                        if full_context_memory
++                        else 0
++                    ),
++                    "full_context_memory_mosaic_latent_count": int(
++                        full_context_memory_stats["mosaic_latent_count"]
++                        if full_context_memory
++                        else 0
++                    ),
++                    "context_as_generated_history": bool(
++                        context_as_generated_history
++                    ),
++                    "context_as_generated_history_frame_count": int(
++                        full_context_memory_stats["frame_count"]
++                        if context_as_generated_history
++                        else 0
++                    ),
++                    "teacher_forced_context_cache_fill": bool(
++                        teacher_context is not None
++                    ),
++                    "teacher_forced_context_latent_count": int(
++                        teacher_context_latent_count
++                    ),
++                    "teacher_forced_context_chunk_count": int(
++                        teacher_context["chunk_count"]
++                        if teacher_context is not None
++                        else 0
++                    ),
++                    "context_prefix_published_chunks": list(
++                        memory_registration_stats[
++                            "context_prefix_published_chunks"
++                        ]
++                    ),
++                    "rolling_kv_frame_count": int(_causal_kv_frame_count(rolling_cache)),
++                    "generated_memory_published_chunks": list(
++                        memory_registration_stats["generated_published_chunks"]
++                    ),
++                    "dynamic_context_visible_entry_count": int(
++                        len(dynamic_context_pool.generated_entries)
++                        if dynamic_context_pool is not None
++                        else 0
++                    ),
++                    "rope": chunk_rope_stats,
++                },
++            }
++
+     if dynamic_context_pool is not None:
+         validation_rope_stats["generated_context_pending_chunks_at_end"] = list(
+             dynamic_context_pool.pending_generated_chunk_indices
+@@ -2414,13 +3907,62 @@ def _run_causal_kv_rollout(
+         history_latents = torch.cat(all_clean, dim=2)
+         mosaic_latent_history = torch.cat(all_mosaic, dim=2)
+     else:
+-        history_latents = torch.cat([initial_c0.detach().cpu()] + all_clean, dim=2)
++        history_latents = torch.cat(
++            [generation_decode_anchor.detach().cpu()] + all_clean, dim=2
++        )
+         mosaic_latent_history = torch.cat(
+-            [initial_c0.detach().cpu()] + all_mosaic, dim=2
++            [generation_decode_anchor.detach().cpu()] + all_mosaic, dim=2
+         )
+     scheduler.set_timesteps(1000, training=False)
+     return history_latents, mosaic_latent_history
+ 
++
++def _run_causal_kv_rollout(
++    unwrapped_model,
++    args,
++    data,
++    val_dataset,
++    handler,
++    history_latents,
++    H_lat,
++    W_lat,
++    H_img,
++    W_img,
++    vae_decode_tiled,
++    num_validation_blocks,
++    latent_window_size,
++    use_mosaic,
++    batch_idx,
++    accelerator=None,
++):
++    """Run the resident-capable iterator to completion for batch inference."""
++
++    iterator = _iter_causal_kv_rollout(
++        unwrapped_model,
++        args,
++        data,
++        val_dataset,
++        handler,
++        history_latents,
++        H_lat,
++        W_lat,
++        H_img,
++        W_img,
++        vae_decode_tiled,
++        num_validation_blocks,
++        latent_window_size,
++        use_mosaic,
++        batch_idx,
++        accelerator=accelerator,
++        decode_output_chunks=False,
++        interactive_camera=False,
++    )
++    while True:
++        try:
++            next(iterator)
++        except StopIteration as stop:
++            return stop.value
++
+ def _normalize_causal_validation_memory_mode(value):
+     mode = str(value or "c0_plus_generated").strip().lower().replace("-", "_")
+     if mode in {"generated", "stage3_dmd_c0_plus_generated"}:
+diff --git a/examples/wanvideo/pipeline/mosaic/config.py b/examples/wanvideo/pipeline/mosaic/config.py
+index 083ea59..91f616f 100644
+--- a/examples/wanvideo/pipeline/mosaic/config.py
++++ b/examples/wanvideo/pipeline/mosaic/config.py
+@@ -871,6 +871,17 @@ def wan_mosaic_parser():
+     )
+     parser.add_argument("--validation_num_inference_steps", type=int, default=25)
+     parser.add_argument("--validation_cfg_scale", type=float, default=5.0)
++    parser.add_argument(
++        "--validation_mosaic_guidance_scale",
++        type=float,
++        default=1.0,
++        help=(
++            "Base validation/inference only: paired mosaic guidance scale. "
++            "1.0 preserves the native single-pass result; values above 1 "
++            "strengthen the mosaic contribution using an extra no-mosaic "
++            "prediction at every denoising step."
++        ),
++    )
+     parser.add_argument(
+         "--validation_negative_no_prope",
+         default=False,
+@@ -2196,15 +2207,24 @@ def wan_mosaic_parser():
+     )
+     parser.add_argument(
+         "--mosaic_candidate_nms_mode",
+-        choices=["none", "temporal", "pose", "projection_iou", "coverage"],
++        choices=[
++            "none",
++            "temporal",
++            "pose",
++            "projection_iou",
++            "coverage",
++            "pose_coverage",
++        ],
+         default="none",
+         help=(
+             "Optional dataset-side candidate NMS / picker. projection_iou and "
+-            "coverage both require mosaic_selection_mode=projection_iou; "
++            "the two coverage modes require mosaic_selection_mode=projection_iou; "
+             "pose_nearest supports temporal/pose. 'coverage' is a greedy "
+             "UNION-coverage picker: it adds the candidate contributing the "
+             "most new query-canvas cells each step (fixes the redundant, "
+-            "mutually-overlapping picks of pose/individual-IoU selectors)."
++            "mutually-overlapping picks of pose/individual-IoU selectors). "
++            "'pose_coverage' first filters by viewing-direction compatibility, "
++            "then runs the same union-coverage picker."
+         ),
+     )
+     parser.add_argument(
+@@ -2251,7 +2271,28 @@ def wan_mosaic_parser():
+             "Memory-pool stride for the vectorised 'coverage' picker: the "
+             "greedy considers every Nth memory frame as a candidate. 1 = full "
+             "pool (best coverage, slowest); 2-4 trade a little coverage for "
+-            "speed. Only used by mosaic_candidate_nms_mode=coverage."
++            "speed. Used by mosaic_candidate_nms_mode=coverage and "
++            "pose_coverage."
++        ),
++    )
++    parser.add_argument(
++        "--mosaic_pose_coverage_pool_size",
++        type=int,
++        default=20,
++        help=(
++            "For mosaic_candidate_nms_mode=pose_coverage, keep at most this "
++            "many smallest-view-angle candidates per query group after the "
++            "angle threshold. 0 keeps every angle-compatible candidate."
++        ),
++    )
++    parser.add_argument(
++        "--mosaic_pose_coverage_max_view_angle_deg",
++        type=float,
++        default=75.0,
++        help=(
++            "Maximum optical-axis angle in degrees admitted by "
++            "mosaic_candidate_nms_mode=pose_coverage. This is a strict filter; "
++            "incompatible views are not used to pad empty candidate slots."
+         ),
+     )
+     parser.add_argument(
+diff --git a/examples/wanvideo/pipeline/mosaic/datasets.py b/examples/wanvideo/pipeline/mosaic/datasets.py
+index 85901c8..7aa9cec 100644
+--- a/examples/wanvideo/pipeline/mosaic/datasets.py
++++ b/examples/wanvideo/pipeline/mosaic/datasets.py
+@@ -173,6 +173,12 @@ def _resolve_dataset_cls_and_extra_kwargs(args):
+     extra_kwargs["mosaic_coverage_pool_stride"] = int(
+         getattr(args, "mosaic_coverage_pool_stride", 2)
+     )
++    extra_kwargs["mosaic_pose_coverage_pool_size"] = int(
++        getattr(args, "mosaic_pose_coverage_pool_size", 20)
++    )
++    extra_kwargs["mosaic_pose_coverage_max_view_angle_deg"] = float(
++        getattr(args, "mosaic_pose_coverage_max_view_angle_deg", 75.0)
++    )
+     extra_kwargs["dynamic_object_mask_filter"] = bool(
+         getattr(args, "dynamic_object_mask_filter", False)
+     )
+diff --git a/examples/wanvideo/pipeline/mosaic/inference.py b/examples/wanvideo/pipeline/mosaic/inference.py
+index 6e00c30..f703c2a 100644
+--- a/examples/wanvideo/pipeline/mosaic/inference.py
++++ b/examples/wanvideo/pipeline/mosaic/inference.py
+@@ -50,6 +50,7 @@ def run_mosaic_segment_inference(
+     cfg_scale=5.0,
+     negative_no_prope=False,
+     negative_no_context=False,
++    mosaic_guidance_scale=1.0,
+     enable_mosaic=True,
+     only_prope=False,
+     mosaic_latent=None,
+@@ -105,6 +106,7 @@ def run_mosaic_segment_inference(
+         "cfg_scale": cfg_scale,
+         "negative_no_prope": negative_no_prope,
+         "negative_no_context": negative_no_context,
++        "mosaic_guidance_scale": mosaic_guidance_scale,
+         "return_latent": return_latent,
+         "latent_rope_time_indices": latent_rope_time_indices,
+         "subject_ref_latents": subject_ref_latents,
+diff --git a/examples/wanvideo/pipeline/mosaic/validation.py b/examples/wanvideo/pipeline/mosaic/validation.py
+index c3d3577..c1b1bd0 100644
+--- a/examples/wanvideo/pipeline/mosaic/validation.py
++++ b/examples/wanvideo/pipeline/mosaic/validation.py
+@@ -1348,6 +1348,16 @@ def _run_mosaic_validation_impl(
+                         coverage_pool_stride=int(
+                             getattr(args, "mosaic_coverage_pool_stride", 2)
+                         ),
++                        pose_coverage_pool_size=int(
++                            getattr(args, "mosaic_pose_coverage_pool_size", 20)
++                        ),
++                        pose_coverage_max_view_angle_deg=float(
++                            getattr(
++                                args,
++                                "mosaic_pose_coverage_max_view_angle_deg",
++                                75.0,
++                            )
++                        ),
+                         source_valid_masks=mosaic_source_valid_masks,
+                         recent_first_cfg=(
+                             {
+@@ -1756,6 +1766,9 @@ def _run_mosaic_validation_impl(
+                 seed=int(args.validation_seed) + batch_idx * 1000 + section_idx,
+                 num_inference_steps=args.validation_num_inference_steps,
+                 cfg_scale=args.validation_cfg_scale,
++                mosaic_guidance_scale=float(
++                    getattr(args, "validation_mosaic_guidance_scale", 1.0)
++                ),
+                 negative_no_prope=bool(
+                     getattr(args, "validation_negative_no_prope", False)
+                 ),
+diff --git a/examples/wanvideo/pipeline/mosaic/video_io.py b/examples/wanvideo/pipeline/mosaic/video_io.py
+index 7c7a089..0c1bfd4 100644
+--- a/examples/wanvideo/pipeline/mosaic/video_io.py
++++ b/examples/wanvideo/pipeline/mosaic/video_io.py
+@@ -392,13 +392,23 @@ def _record_validation_candidate_frames(
+     frames,
+     *,
+     start_index,
++    max_width=None,
+ ):
+     if frames is None:
+         return candidate_frames_by_id
+     for offset, frame in enumerate(frames):
+-        candidate_frames_by_id[int(start_index) + int(offset)] = (
+-            _candidate_frame_to_uint8_hwc(frame).copy()
+-        )
++        frame_arr = _candidate_frame_to_uint8_hwc(frame)
++        if max_width is not None and int(frame_arr.shape[1]) > int(max_width):
++            target_w = int(max_width)
++            target_h = max(
++                1, int(round(int(frame_arr.shape[0]) * target_w / frame_arr.shape[1]))
++            )
++            frame_arr = np.asarray(
++                Image.fromarray(frame_arr).resize(
++                    (target_w, target_h), Image.Resampling.LANCZOS
++                )
++            )
++        candidate_frames_by_id[int(start_index) + int(offset)] = frame_arr.copy()
+     return candidate_frames_by_id
+ 
+ 
+diff --git a/frustum/frustum_handler.py b/frustum/frustum_handler.py
+index 2660bd2..afe12fa 100644
+--- a/frustum/frustum_handler.py
++++ b/frustum/frustum_handler.py
+@@ -552,6 +552,8 @@ class FrustumHandler:
+         depth_input_size: Optional[int] = None,
+         da3_process_res: Optional[int] = None,
+         da3_autocast_dtype: Optional[str] = None,
++        da3_align_input_pose_scale: bool = False,
++        da3_pose_scale_min_baseline: float = 0.05,
+         depth_fp32: bool = False,
+         keyframe_rot_thresh_deg: float = 45,
+         keyframe_trans_thresh: float = 1,
+@@ -598,6 +600,11 @@ class FrustumHandler:
+                 "da3_autocast_dtype must be one of none/float16/bfloat16, "
+                 f"got {da3_autocast_dtype!r}"
+             )
++        self._da3_align_input_pose_scale = bool(da3_align_input_pose_scale)
++        self._da3_pose_scale_min_baseline = float(da3_pose_scale_min_baseline)
++        if self._da3_pose_scale_min_baseline < 0.0:
++            raise ValueError("da3_pose_scale_min_baseline must be >= 0")
++        self._da3_input_pose_alignment_scale = None
+         self._depth_fp32 = bool(depth_fp32)
+ 
+         # 关键帧参数：硬阈值 + 时间强制阈值
+@@ -686,6 +693,7 @@ class FrustumHandler:
+             "extrinsics": self.extrinsics,
+             "frames": self.frames,
+             "is_c2w": self._is_c2w,
++            "da3_input_pose_alignment_scale": self._da3_input_pose_alignment_scale,
+         }
+         return state
+ 
+@@ -702,6 +710,9 @@ class FrustumHandler:
+         ]  # 只保留最近的 depth_infer_fps 帧
+         self.frames = state.get("frames", [])[clip_num:]
+         self._is_c2w = state.get("is_c2w", True)
++        self._da3_input_pose_alignment_scale = state.get(
++            "da3_input_pose_alignment_scale"
++        )
+         self.last_extrinsic = self.extrinsics[-1] if self.extrinsics else np.eye(4)
+ 
+     def reestimate_depth(self, frames: Sequence[np.ndarray]) -> None:
+@@ -947,11 +958,101 @@ class FrustumHandler:
+                         "estimator pose is disabled.",
+                         flush=True,
+                     )
++                inference_kwargs = {
++                    "use_ray_pose": need_da3_pose,
++                    "process_res": self._da3_process_res,
++                }
++                if (
++                    self._da3_align_input_pose_scale
++                    and force_using_input_extrinics
++                    and intrinsics is not None
++                ):
++                    da3_input_w2c = (
++                        np.stack([invert_pose(pose) for pose in extrinsics], axis=0)
++                        if self._is_c2w
++                        else extrinsics.copy()
++                    )
++                    rotations = da3_input_w2c[:, :3, :3]
++                    translations = da3_input_w2c[:, :3, 3]
++                    camera_centers = -np.einsum(
++                        "nij,nj->ni", rotations.transpose(0, 2, 1), translations
++                    )
++                    baseline = float(
++                        np.linalg.norm(camera_centers - camera_centers[:1], axis=1).max()
++                    )
++                    if (
++                        len(da3_input_w2c) >= 3
++                        and np.isfinite(baseline)
++                        and baseline >= self._da3_pose_scale_min_baseline
++                    ):
++                        inference_kwargs.update(
++                            extrinsics=da3_input_w2c,
++                            intrinsics=intrinsics,
++                            align_to_input_ext_scale=True,
++                        )
++                        print(
++                            "Aligning DA3 depth scale to caller-provided camera "
++                            f"trajectory (baseline={baseline:.4f}).",
++                            flush=True,
++                        )
++                    else:
++                        print(
++                            "Skipping DA3 input-pose scale alignment for a "
++                            f"degenerate trajectory (frames={len(da3_input_w2c)}, "
++                            f"baseline={baseline:.6f}); using DA3 metric depth.",
++                            flush=True,
++                        )
+                 with torch.no_grad(), autocast_context:
+                     prediction = self._depth_estimator.inference(
+                         pil_frames,
+-                        use_ray_pose=need_da3_pose,
+-                        process_res=self._da3_process_res,
++                        **inference_kwargs,
++                    )
++                aligned_to_input_pose = "extrinsics" in inference_kwargs
++                if aligned_to_input_pose:
++                    prediction_aux = getattr(prediction, "aux", None) or {}
++                    alignment_scale = prediction_aux.get(
++                        "input_pose_alignment_scale"
++                    )
++                    if alignment_scale is None:
++                        raise RuntimeError(
++                            "DA3 input-pose alignment did not report its scale; "
++                            "cannot keep later depth registrations in one unit."
++                        )
++                    alignment_scale = float(alignment_scale)
++                    if not np.isfinite(alignment_scale) or alignment_scale <= 0.0:
++                        raise RuntimeError(
++                            "DA3 input-pose alignment returned an invalid scale: "
++                            f"{alignment_scale!r}."
++                        )
++                    self._da3_input_pose_alignment_scale = alignment_scale
++                    alignment_mode = prediction_aux.get(
++                        "input_pose_alignment_mode", "unknown"
++                    )
++                    if alignment_mode in {
++                        "global_umeyama_retry",
++                        "native_metric_fallback",
++                    }:
++                        print(
++                            "DA3 input-pose alignment mode: "
++                            f"{alignment_mode}; caller poses remain in metres.",
++                            flush=True,
++                        )
++                    print(
++                        "DA3 input-pose depth scale established: "
++                        f"scale={alignment_scale:.8g}.",
++                        flush=True,
++                    )
++                elif (
++                    self._da3_align_input_pose_scale
++                    and force_using_input_extrinics
++                    and self._da3_input_pose_alignment_scale is not None
++                ):
++                    alignment_scale = float(self._da3_input_pose_alignment_scale)
++                    prediction.depth = np.asarray(prediction.depth) / alignment_scale
++                    print(
++                        "Reusing DA3 input-pose depth scale for the degenerate "
++                        f"trajectory: scale={alignment_scale:.8g}.",
++                        flush=True,
+                     )
+                 depths = prediction.depth  # [N, H, W] float32 array
+                 if not force_using_input_extrinics:
+@@ -1799,20 +1900,25 @@ class FrustumHandler:
+         query_reference_frame: int = 2,
+         coverage_grid_downsample: int = 4,
+         coverage_pool_stride: int = 2,
++        pose_compatible: bool = False,
++        pose_pool_size: int = 20,
++        max_view_angle_deg: float = 75.0,
++        memory_quality: Optional[np.ndarray] = None,
++        memory_quality_floor: float = 0.0,
+         depth_downsample_pool: Optional[Dict] = None,
+     ) -> List[List[int]]:
+-        """Fast UNION-coverage candidate selection (the ``coverage`` picker).
++        """Fast UNION-coverage selection for ``coverage`` / ``pose_coverage``.
+ 
+-        A fully VECTORISED, FULL-POOL greedy-coverage selector that avoids both
++        A fully vectorised greedy-coverage selector that avoids both
+         slow parts of the per-candidate ``projection_iou`` path:
+ 
+           * No per-(query_group, candidate) Python loop / reproject call -- ALL
+             pool frames are forward-warped into ALL query reference cameras in a
+             handful of batched numpy ops.
+-          * No angle pre-filter / coarse_k cap -- the greedy picks from the whole
+-            memory pool (optionally strided), so it can grab a frame that covers
+-            the query periphery from a very different viewpoint (exactly what
+-            pose_nearest / individual-IoU pickers miss).
++          * ``coverage`` uses the full (optionally strided) memory pool.
++          * ``pose_coverage`` first keeps only optically compatible candidates,
++            then runs the identical greedy union-coverage objective. This keeps
++            large projected areas from an opposing view out of the mosaic.
+ 
+         Geometry is identical to ``reproject_pixels_nd_to_nd`` (same lift +
+         project math, ``nearest`` depth), so the coverage masks reflect what the
+@@ -1840,6 +1946,21 @@ class FrustumHandler:
+ 
+         pool = np.arange(0, G, ps)
+         M = len(pool)
++        quality_floor = float(memory_quality_floor)
++        if not np.isfinite(quality_floor) or not 0.0 <= quality_floor <= 1.0:
++            raise ValueError("memory_quality_floor must be finite and in [0, 1].")
++        if memory_quality is None:
++            pool_quality = np.ones(M, dtype=np.float64)
++        else:
++            quality = np.asarray(memory_quality, dtype=np.float64)
++            if quality.ndim != 1 or int(quality.shape[0]) != G:
++                raise ValueError(
++                    "memory_quality must have shape (num_memory_frames,), "
++                    f"got {quality.shape} for {G} frames."
++                )
++            quality = np.nan_to_num(quality, nan=0.0, posinf=1.0, neginf=0.0)
++            quality = np.clip(quality, 0.0, 1.0)
++            pool_quality = quality_floor + (1.0 - quality_floor) * quality[pool]
+         w2c = np.asarray(w2c, dtype=np.float64)
+         memory_K = np.asarray(memory_K, dtype=np.float64)
+         if memory_K.shape == (3, 3):
+@@ -1912,6 +2033,44 @@ class FrustumHandler:
+         gg, mm, pp = np.where(inb)
+         masks[gg, mm, ci[gg, mm, pp], cj[gg, mm, pp]] = True
+ 
++        pose_allowed = np.ones((n_groups, M), dtype=bool)
++        if pose_compatible:
++            pool_size = int(pose_pool_size)
++            max_angle = float(max_view_angle_deg)
++            if pool_size < 0:
++                raise ValueError("pose_pool_size must be >= 0.")
++            if not np.isfinite(max_angle) or not 0.0 <= max_angle <= 180.0:
++                raise ValueError(
++                    "max_view_angle_deg must be finite and in [0, 180], "
++                    f"got {max_view_angle_deg!r}."
++                )
++
++            # For w2c matrices the third row of R is the camera optical axis
++            # expressed in world coordinates. Roll is deliberately ignored:
++            # this filter measures viewing-direction compatibility, not FOV.
++            memory_dirs = w2c[pool, 2, :3]
++            query_dirs = query_extrinsics[qidx, 2, :3]
++            memory_dirs = memory_dirs / np.maximum(
++                np.linalg.norm(memory_dirs, axis=1, keepdims=True), 1e-12
++            )
++            query_dirs = query_dirs / np.maximum(
++                np.linalg.norm(query_dirs, axis=1, keepdims=True), 1e-12
++            )
++            angles = np.degrees(
++                np.arccos(np.clip(query_dirs @ memory_dirs.T, -1.0, 1.0))
++            )
++            pose_allowed = angles <= max_angle
++            if pool_size > 0:
++                for g in range(n_groups):
++                    compatible = np.flatnonzero(pose_allowed[g])
++                    if compatible.size <= pool_size:
++                        continue
++                    keep = compatible[
++                        np.argsort(angles[g, compatible], kind="stable")[:pool_size]
++                    ]
++                    pose_allowed[g] = False
++                    pose_allowed[g, keep] = True
++
+         # ---- per-group greedy union-coverage pick over the full pool ----
+         out: List[List[int]] = []
+         flat = masks.reshape(n_groups, M, Hd * Wd)
+@@ -1919,13 +2078,14 @@ class FrustumHandler:
+         for g in range(n_groups):
+             mg = flat[g]
+             union = np.zeros(Hd * Wd, dtype=bool)
+-            avail = np.ones(M, dtype=bool)
++            avail = pose_allowed[g].copy()
+             picked: List[int] = []
+             for _ in range(cpqg):
+                 gain = (mg & ~union).sum(axis=1)
+-                gain[~avail] = -1
+-                bi = int(gain.argmax())
+-                if gain[bi] <= 0:
++                weighted_gain = gain.astype(np.float64) * pool_quality
++                weighted_gain[~avail] = -1.0
++                bi = int(weighted_gain.argmax())
++                if gain[bi] <= 0 or weighted_gain[bi] <= 0.0:
+                     break
+                 union |= mg[bi]
+                 picked.append(int(pool[bi]))
+@@ -1933,18 +2093,24 @@ class FrustumHandler:
+             if len(picked) < cpqg:
+                 # No remaining frame adds coverage: fill with largest-area
+                 # unpicked frames so the per-group budget stays honoured.
+-                ar = area[g].copy()
+-                ar[~avail] = -1
+-                for bi in np.argsort(-ar):
+-                    if avail[bi] and ar[bi] > 0:
++                ar = area[g].astype(np.float64) * pool_quality
++                ar[~avail] = -1.0
++                for bi in np.argsort(-ar, kind="stable"):
++                    if avail[bi] and ar[bi] > 0.0:
+                         picked.append(int(pool[bi]))
+                         avail[bi] = False
+                     if len(picked) >= cpqg:
+                         break
+-            if not picked:
+-                picked = [-1]
+-            while len(picked) < cpqg:
+-                picked.append(picked[-1])
++            if pose_compatible:
++                # A strict orientation filter must not silently reintroduce an
++                # opposing view merely to fill the configured candidate count.
++                while len(picked) < cpqg:
++                    picked.append(-1)
++            else:
++                if not picked:
++                    picked = [-1]
++                while len(picked) < cpqg:
++                    picked.append(picked[-1])
+             out.append(picked)
+         return out
+ 
+@@ -2751,6 +2917,10 @@ class FrustumHandler:
+         depth_downsample_pool: Optional[Dict] = None,
+         coverage_grid_downsample: int = 4,
+         coverage_pool_stride: int = 2,
++        pose_coverage_pool_size: int = 20,
++        pose_coverage_max_view_angle_deg: float = 75.0,
++        memory_quality: Optional[np.ndarray] = None,
++        memory_quality_floor: float = 0.0,
+     ) -> List[List[int]]:
+         """Phase 1 of the split mosaic-query pipeline: pick candidate frame ids
+         per query group **without** touching any latent buffer.
+@@ -2801,15 +2971,17 @@ class FrustumHandler:
+             "temporal",
+             "pose",
+             "coverage",
++            "pose_coverage",
+         }:
+             raise ValueError(
+                 f"Unsupported candidate_nms_mode={candidate_nms_mode!r}. Use "
+-                "'projection_iou', 'temporal', 'pose', 'coverage' or None."
++                "'projection_iou', 'temporal', 'pose', 'coverage', "
++                "'pose_coverage' or None."
+             )
+ 
+         pose_selection_modes = {"pose_nearest", "pose_pool_temporal_earliest"}
+         if selection_mode in pose_selection_modes:
+-            if candidate_nms_mode in ("projection_iou", "coverage"):
++            if candidate_nms_mode in ("projection_iou", "coverage", "pose_coverage"):
+                 # ``pose_nearest`` skips the per-candidate projection step
+                 # entirely, so we have no proj_bbox / coverage_mask to pick
+                 # on. Both projection-based pickers require the projection_iou
+@@ -2927,7 +3099,7 @@ class FrustumHandler:
+                 f"got {selection_mode!r}."
+             )
+ 
+-        if candidate_nms_mode == "coverage":
++        if candidate_nms_mode in {"coverage", "pose_coverage"}:
+             # This branch returns early, so it must re-assert the same
+             # buffer-sanity guards the main projection_iou path enforces below
+             # (the early return would otherwise silently skip them). The
+@@ -2936,7 +3108,7 @@ class FrustumHandler:
+             # (when given) must equal the memory length.
+             if bool(latent_merge_4frames):
+                 raise ValueError(
+-                    "candidate_nms_mode='coverage' does not support "
++                    f"candidate_nms_mode={candidate_nms_mode!r} does not support "
+                     "latent_merge_4frames=True (the vectorised coverage picker "
+                     "assumes one latent per memory frame)."
+                 )
+@@ -2967,7 +3139,8 @@ class FrustumHandler:
+                     cov_memory_K = np.asarray(self._Kpix, dtype=np.float64)
+                 else:
+                     raise ValueError(
+-                        "candidate_nms_mode='coverage': no memory intrinsics. "
++                        f"candidate_nms_mode={candidate_nms_mode!r}: no memory "
++                        "intrinsics. "
+                         "Pass memory_K/K, or register a source sequence first."
+                     )
+             if cov_query_K is None:
+@@ -2983,7 +3156,8 @@ class FrustumHandler:
+                     cov_query_K = np.asarray(self._Kpix, dtype=np.float64)
+                 else:
+                     raise ValueError(
+-                        "candidate_nms_mode='coverage': per-frame memory_K was "
++                        f"candidate_nms_mode={candidate_nms_mode!r}: per-frame "
++                        "memory_K was "
+                         "given but query_K was not, and no registered query "
+                         "intrinsic is available. Pass query_K together with "
+                         "memory_K."
+@@ -3000,6 +3174,11 @@ class FrustumHandler:
+                 query_reference_frame=query_reference_frame,
+                 coverage_grid_downsample=coverage_grid_downsample,
+                 coverage_pool_stride=coverage_pool_stride,
++                pose_compatible=(candidate_nms_mode == "pose_coverage"),
++                pose_pool_size=pose_coverage_pool_size,
++                max_view_angle_deg=pose_coverage_max_view_angle_deg,
++                memory_quality=memory_quality,
++                memory_quality_floor=memory_quality_floor,
+                 depth_downsample_pool=depth_downsample_pool,
+             )
+ 
+@@ -3301,6 +3480,10 @@ class FrustumHandler:
+         candidate_nms_pool_multiplier: float = 2.0,
+         coverage_grid_downsample: int = 4,
+         coverage_pool_stride: int = 2,
++        pose_coverage_pool_size: int = 20,
++        pose_coverage_max_view_angle_deg: float = 75.0,
++        memory_quality: Optional[np.ndarray] = None,
++        memory_quality_floor: float = 0.0,
+         memory_frames=None,
+         recent_first_cfg: Optional[Dict] = None,
+         return_view_change: bool = False,
+@@ -3373,6 +3556,12 @@ class FrustumHandler:
+                 candidate_nms_pool_multiplier=candidate_nms_pool_multiplier,
+                 coverage_grid_downsample=coverage_grid_downsample,
+                 coverage_pool_stride=coverage_pool_stride,
++                pose_coverage_pool_size=pose_coverage_pool_size,
++                pose_coverage_max_view_angle_deg=(
++                    pose_coverage_max_view_angle_deg
++                ),
++                memory_quality=memory_quality,
++                memory_quality_floor=memory_quality_floor,
+                 depth_downsample_pool=depth_downsample_pool,
+             )
+         finally:
+diff --git a/infer.py b/infer.py
+index 7fbe853..afa1347 100644
+--- a/infer.py
++++ b/infer.py
+@@ -372,6 +372,23 @@ def collect_outputs(val_dir, out_root):
+         elif f.endswith(".mp4"):
+             # panel video; GT row is stripped below
+             results["memory_visualization.mp4"] = path
++
++    # The verbose history compositor contains the information needed to audit
++    # Patch Memory retrieval frame by frame: generated RGB on the upper left,
++    # decoded warped/fused mosaic on the lower left, and the selected source
++    # frames (with memory frame ids) on the right. Validation writes it under
++    # _temp, which is normally deleted after a successful user inference, so
++    # promote it to a first-class output before cleanup.
++    temp_dir = os.path.join(val_dir, "_temp")
++    if os.path.isdir(temp_dir):
++        history_temp_files = sorted(
++            f for f in os.listdir(temp_dir) if f.endswith("_history_temp.mp4")
++        )
++        if history_temp_files:
++            results["memory_candidates_visualization.mp4"] = os.path.join(
++                temp_dir, history_temp_files[-1]
++            )
++
+     for name, src in results.items():
+         dst = os.path.join(out_root, name)
+         if name == "memory_visualization.mp4":
+diff --git a/infer_distilled.py b/infer_distilled.py
+index 18fccde..f686db4 100644
+--- a/infer_distilled.py
++++ b/infer_distilled.py
+@@ -41,6 +41,11 @@ def build_parser():
+     parser.add_argument("--tokenizer-dir", default="")
+     parser.add_argument("--da3-dir", default="")
+     parser.add_argument("--output", type=Path, default=Path("result.mp4"))
++    parser.add_argument(
++        "--memory-visualization",
++        type=Path,
++        help="optional selected-memory + decoded-mosaic diagnostic MP4",
++    )
+     parser.add_argument(
+         "--accelerate-config", type=Path, default=DEFAULT_ACCELERATE_CONFIG
+     )
+@@ -63,6 +68,11 @@ def validate_cli(args):
+             raise SystemExit(f"ERROR: {label} does not exist: {path}")
+     if args.output.suffix.lower() != ".mp4":
+         raise SystemExit("ERROR: --output must be an .mp4 file path")
++    if (
++        args.memory_visualization is not None
++        and args.memory_visualization.suffix.lower() != ".mp4"
++    ):
++        raise SystemExit("ERROR: --memory-visualization must be an .mp4 file path")
+     load_inference_config(args.config)
+ 
+ 
+@@ -90,7 +100,7 @@ def build_command(
+     tmp_root,
+     output,
+ ):
+-    return [
++    command = [
+         sys.executable,
+         "-m",
+         "accelerate.commands.launch",
+@@ -114,6 +124,14 @@ def build_command(
+         "--output",
+         str(output),
+     ]
++    if args.memory_visualization is not None:
++        command.extend(
++            [
++                "--memory-visualization",
++                str(args.memory_visualization.expanduser().resolve()),
++            ]
++        )
++    return command
+ 
+ 
+ def main(argv=None):
+@@ -122,6 +140,10 @@ def main(argv=None):
+     config = load_inference_config(args.config)
+     output = args.output.expanduser().resolve()
+     output.parent.mkdir(parents=True, exist_ok=True)
++    if args.memory_visualization is not None:
++        args.memory_visualization.expanduser().resolve().parent.mkdir(
++            parents=True, exist_ok=True
++        )
+ 
+     env = os.environ.copy()
+     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+diff --git a/third_party/depth-anything-3/src/depth_anything_3/api.py b/third_party/depth-anything-3/src/depth_anything_3/api.py
+index 24b9bb9..154b9a9 100644
+--- a/third_party/depth-anything-3/src/depth_anything_3/api.py
++++ b/third_party/depth-anything-3/src/depth_anything_3/api.py
+@@ -44,6 +44,60 @@ SAFETENSORS_NAME = "model.safetensors"
+ CONFIG_NAME = "config.json"
+ 
+ 
++def _is_zero_translation_variance_error(error: ValueError) -> bool:
++    return "zero translation variance" in str(error).lower()
++
++
++def _align_poses_with_fallback(
++    prediction_extrinsics: np.ndarray,
++    input_extrinsics: np.ndarray,
++    *,
++    ransac_view_thresh: int = 10,
++):
++    """Align DA3 poses, degrading only when the estimated path is degenerate.
++
++    RANSAC can choose an all-rotation/duplicate subset even when the input path
++    translates. A global Umeyama retry handles that case. If DA3's complete
++    estimated path has no translation variance, no Sim(3) scale is identifiable;
++    the caller then keeps DA3's native metric depth and uses scale 1.
++    """
++
++    use_ransac = len(input_extrinsics) >= int(ransac_view_thresh)
++    try:
++        result = align_poses_umeyama(
++            prediction_extrinsics,
++            input_extrinsics,
++            ransac=use_ransac,
++            return_aligned=True,
++            random_state=42,
++        )
++        return (*result, "ransac" if use_ransac else "umeyama", None)
++    except ValueError as ransac_error:
++        if not _is_zero_translation_variance_error(ransac_error) or not use_ransac:
++            raise
++
++        try:
++            result = align_poses_umeyama(
++                prediction_extrinsics,
++                input_extrinsics,
++                ransac=False,
++                return_aligned=True,
++                random_state=42,
++            )
++            return (*result, "global_umeyama_retry", str(ransac_error))
++        except ValueError as global_error:
++            if not _is_zero_translation_variance_error(global_error):
++                raise
++            return (
++                None,
++                None,
++                1.0,
++                None,
++                "native_metric_fallback",
++                f"RANSAC: {ransac_error}; global: {global_error}",
++            )
++
++
+ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
+     """
+     Depth Anything 3 main API class.
+@@ -349,17 +403,28 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
+         if extrinsics is None:
+             return prediction
+         prediction.intrinsics = intrinsics.numpy()
+-        _, _, scale, aligned_extrinsics = align_poses_umeyama(
++        (
++            _,
++            _,
++            scale,
++            aligned_extrinsics,
++            alignment_mode,
++            alignment_error,
++        ) = _align_poses_with_fallback(
+             prediction.extrinsics,
+             extrinsics.numpy(),
+-            ransac=len(extrinsics) >= ransac_view_thresh,
+-            return_aligned=True,
+-            random_state=42,
++            ransac_view_thresh=ransac_view_thresh,
+         )
++        if prediction.aux is None:
++            prediction.aux = {}
++        prediction.aux["input_pose_alignment_scale"] = float(scale)
++        prediction.aux["input_pose_alignment_mode"] = alignment_mode
++        if alignment_error is not None:
++            prediction.aux["input_pose_alignment_error"] = alignment_error
+         if align_to_input_ext_scale:
+             prediction.extrinsics = extrinsics[..., :3, :].numpy()
+             prediction.depth /= scale
+-        else:
++        elif aligned_extrinsics is not None:
+             prediction.extrinsics = aligned_extrinsics
+         return prediction
+ 
+diff --git a/tools/run_distilled_inference.py b/tools/run_distilled_inference.py
+index 6066474..cd0ff3f 100644
+--- a/tools/run_distilled_inference.py
++++ b/tools/run_distilled_inference.py
+@@ -42,6 +42,7 @@ def build_parser():
+     parser.add_argument("--tokenizer-dir", required=True, type=Path)
+     parser.add_argument("--memory-cache-dir", required=True, type=Path)
+     parser.add_argument("--output", required=True, type=Path)
++    parser.add_argument("--memory-visualization", type=Path)
+     return parser
+ 
+ 
+@@ -143,6 +144,7 @@ def main(argv=None):
+     args.dataset_pass_id = 0
+     args.start_epoch = 0
+     args.start_global_step = 0
++    args.causal_memory_visualization_path = str(cli.memory_visualization or "")
+ 
+     accelerator = accelerate.Accelerator(
+         gradient_accumulation_steps=1,

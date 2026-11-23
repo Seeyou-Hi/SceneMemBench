@@ -1,0 +1,3 @@
+# Portable native defaults; not a frozen historical experiment configuration.
+pipeline:
+  model_path: ${SCENEMEMBENCH_CKPT_DIR}/SANA-WM_streaming

@@ -1,0 +1,7 @@
+# Portable native defaults; not a frozen historical experiment configuration.
+pipeline:
+  model_path: ${SCENEMEMBENCH_CKPT_DIR}/HY-WorldPlay
+  required_components:
+    video_model_path: ${SCENEMEMBENCH_CKPT_DIR}/HunyuanVideo-1.5
+  enable_group_offloading: true
+  overlap_group_offloading: false

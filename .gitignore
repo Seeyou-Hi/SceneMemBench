@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+*credentials*.txt
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated outputs and large local assets
+outputs/
+results/
+checkpoints/
+wandb/
+data/raw/
+data/downloads/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.mp4
+*.mov
+*.avi
+*.log
+
+# Generated fixtures and local backend settings
+data/demo/
+*.local.yaml
+
+# Runtime caches and prepared real-data images
+.cache/
+locks/native-mini-tested.json

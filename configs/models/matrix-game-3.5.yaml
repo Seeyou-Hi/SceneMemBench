@@ -1,0 +1,13 @@
+# Portable native defaults; not a frozen historical experiment configuration.
+upstream_source: ${SCENEMEMBENCH_MG35_SOURCE}
+environment:
+  SCENEMEMBENCH_MATRIX_GAME35_CONTEXT_AS_GENERATED_HISTORY: '1'
+  SCENEMEMBENCH_MATRIX_GAME35_FULL_CONTEXT_MEMORY: '0'
+  SCENEMEMBENCH_MATRIX_GAME35_MEMORY_BOOTSTRAP: c0_only
+pipeline:
+  model_path: ${SCENEMEMBENCH_CKPT_DIR}/Matrix-Game-3.5/first-person.safetensors
+  required_components:
+    wan_dir: ${WAN22_TI2V_5B_DIR}
+    tokenizer_dir: ${UMT5_TOKENIZER_DIR}
+    da3_model: ${SCENEMEMBENCH_CKPT_DIR}/DA3NESTED-GIANT-LARGE-1.1
+    work_dir: /tmp

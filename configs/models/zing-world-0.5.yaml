@@ -1,0 +1,6 @@
+# Portable native defaults; not a frozen historical experiment configuration.
+full_continuation: true
+pipeline:
+  model_path: ${SCENEMEMBENCH_CKPT_DIR}/Zing-0.5
+  source_root: ${SCENEMEMBENCH_ZING_SOURCE}
+  pretrained_dir: ${SCENEMEMBENCH_CKPT_DIR}/Zing-0.5/pretrained

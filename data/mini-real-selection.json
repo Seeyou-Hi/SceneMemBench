@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "status": "packaged_and_locally_validated",
+  "selected_on": "2026-10-18",
+  "source_dataset": "GeoMemBench_final",
+  "frame_range_convention": "zero-based half-open [start, end)",
+  "cases": [
+    {
+      "mini_id": "greek_island_reversed_rotation",
+      "trajectory": "Reversed Rotation",
+      "task": "seen",
+      "scene": "Greek_Island",
+      "source_case_id": "Greek_Island_001",
+      "source_relative_path": "01_Reversal_Return/Greek_Island_001",
+      "context_source_range": [
+        0,
+        84
+      ],
+      "query_source_range": [
+        84,
+        168
+      ],
+      "export_source_range": [
+        0,
+        168
+      ],
+      "fps": 24.0,
+      "context_decoded_frames": 84,
+      "query_decoded_frames": 84,
+      "source_pose_rows": 168,
+      "excluded_source_range": null,
+      "source_manifest_sha256": "8efaca825182606662b28c46281348b09253201f1485dbcecaed124136372831",
+      "source_poses_sha256": "39ddc8e9c254268bf6f16f7e4c2cc06fb18281c6ce2bb345cab30b3621c413f4",
+      "selection_reason": "Clear red pillars, a blue-white building and rock landmarks make the turn and return easy to follow.",
+      "selection_basis": "GT visual composition and trajectory coverage; model predictions were not used."
+    },
+    {
+      "mini_id": "greek_island_full_rotation",
+      "trajectory": "Full Rotation",
+      "task": "seen",
+      "scene": "Greek_Island",
+      "source_case_id": "Greek_Island_004_loop_closure",
+      "source_relative_path": "02_Rotational_Loop_Revisit/Greek_Island_004/loop_closure",
+      "context_source_range": [
+        0,
+        203
+      ],
+      "query_source_range": [
+        203,
+        288
+      ],
+      "export_source_range": [
+        0,
+        288
+      ],
+      "fps": 24.0,
+      "context_decoded_frames": 203,
+      "query_decoded_frames": 85,
+      "source_pose_rows": 288,
+      "excluded_source_range": null,
+      "source_manifest_sha256": "20fae752b259923af3becd51a8801417c6be2b72b9c8c4f3df975ca8f94e6bc0",
+      "source_poses_sha256": "5fc372929caea0013aaf8b3f59afcdac773ebd9feb8a684117353fe25bcb9125",
+      "selection_reason": "An open seaside square shows varied landmarks throughout the full rotation with a recognizable return view.",
+      "selection_basis": "GT visual composition and trajectory coverage; model predictions were not used."
+    },
+    {
+      "mini_id": "greek_island_forward_look_back",
+      "trajectory": "Forward and Look Back",
+      "task": "novel",
+      "scene": "Greek_Island",
+      "source_case_id": "Greek_Island_002",
+      "source_relative_path": "03_Straight_Turn_Back_Revisit/Greek_Island_002",
+      "context_source_range": [
+        0,
+        457
+      ],
+      "query_source_range": [
+        457,
+        518
+      ],
+      "export_source_range": [
+        0,
+        518
+      ],
+      "fps": 24.0,
+      "context_decoded_frames": 457,
+      "query_decoded_frames": 61,
+      "source_pose_rows": 676,
+      "excluded_source_range": [
+        518,
+        676
+      ],
+      "source_manifest_sha256": "0a2bae7694a3bb4adbe67d867ff9ea0ed4e9588bba216efa8ce8db3b57cba337",
+      "source_poses_sha256": "a2cc2d789f87257c2ee000afc03b0381bc55e349d94dfc42f36541451d8e6b82",
+      "selection_reason": "A walk through the market street followed by a turn toward the statue illustrates recovery from the opposite direction.",
+      "selection_basis": "GT visual composition and trajectory coverage; model predictions were not used."
+    },
+    {
+      "mini_id": "greek_island_new_viewpoint",
+      "trajectory": "New-Viewpoint Revisit",
+      "task": "novel",
+      "scene": "Greek_Island",
+      "source_case_id": "Greek_Island_010",
+      "source_relative_path": "04_Cross_View_Revisit/Greek_Island_010",
+      "context_source_range": [
+        0,
+        600
+      ],
+      "query_source_range": [
+        600,
+        686
+      ],
+      "export_source_range": [
+        0,
+        686
+      ],
+      "fps": 24.0,
+      "context_decoded_frames": 600,
+      "query_decoded_frames": 86,
+      "source_pose_rows": 686,
+      "excluded_source_range": null,
+      "source_manifest_sha256": "d818623f0a67db8f0d3e8da351b7afc45f850f18210c6fd3ce38a24ca11f70ef",
+      "source_poses_sha256": "38ae5c297ad30fa7bf827ed2c2a36a6769ed399c93929be9d77b0f54a7cd10c2",
+      "selection_reason": "User-selected case: the blue-white building is observed again from a displaced viewpoint.",
+      "selection_basis": "User choice"
+    }
+  ],
+  "package": {
+    "filename": "scenemembench-greek-island-mini-v1.tar.gz",
+    "bytes": 68746598,
+    "sha256": "e26a279951ce11ce652b262918d51ea01d7afc9f8513e83ab97445d005672ddd",
+    "rgb_storage": "Context video decoded on demand; Query reference video",
+    "context_frames": 1344,
+    "query_frames": 316
+  }
+}

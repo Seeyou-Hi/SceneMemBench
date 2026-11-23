@@ -1,0 +1,5 @@
+# Portable native defaults; not a frozen historical experiment configuration.
+pipeline:
+  model_path: ${SCENEMEMBENCH_CKPT_DIR}/lingbot-world-v2-14b-causal-fast
+  dit_fsdp: true
+  t5_cpu: true

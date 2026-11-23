@@ -1,0 +1,16 @@
+SceneMemBench
+
+Standalone continuation and evaluation adaptations by the SceneMemBench contributors.
+Selected runtime and evaluation components were adapted from WorldFoundry
+(Seeyou-Hi/Memory-Benchmark). Per-file origins and modifications are recorded in
+docs/source_manifest.json. No WorldFoundry or PlayWorld installation is required.
+Original copyright headers and component-specific licenses remain applicable.
+
+Tencent HY-WorldPlay is licensed under the Tencent HY-WorldPlay Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+LingBot-World-v2 components adapted from Robbyant/lingbot-world-v2 revision
+94f43115de8d4a4f9f282126528c300a0b232c5f retain CC BY-NC-SA 4.0 terms.
+
+See THIRD_PARTY_NOTICES.md and licenses/ for component attribution and terms.
+
+Tencent Hunyuan is licensed under the Tencent Hunyuan Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.

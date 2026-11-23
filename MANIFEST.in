@@ -1,0 +1,9 @@
+include README.md NOTICE THIRD_PARTY_NOTICES.md
+recursive-include licenses *
+recursive-include docs *.md *.json
+recursive-include configs *.yaml
+recursive-include locks *.txt *.json
+recursive-include backends *.patch
+include data/README.md data/mini-synthetic-v1.tar.gz
+include scripts/prepare_mg35.py
+recursive-include tests *.py

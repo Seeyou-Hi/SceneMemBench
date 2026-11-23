@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/Riemann-Dynamics/Matrix-Game-3.5.git",
+  "revision": "fa6d2b628ac9b0f1657dc24689536d74bfeb51da",
+  "patch": "backends/matrix-game-3.5/native-history.patch",
+  "patch_sha256": "7cecfbdd0470f0ee84742bd18da900e3bf646ce796f063fc4aa5209ed1820a31",
+  "purpose": "Native resident/history support required by the bundled MG3.5 driver; not a historical execution attestation."
+}
