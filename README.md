@@ -6,7 +6,7 @@
 
 **Can a world model remember a scene after it leaves the view?**
 
-[Quickstart](#quickstart) · [Evaluation](#evaluate-all-six-metrics) · [Native models](#run-a-native-model)
+[Project Page](https://yuheng-si.github.io/SceneMemBench/) · [Dataset](https://huggingface.co/datasets/scenemembench/SceneMemBench) · arXiv (coming soon)
 
 </div>
 
